@@ -1,0 +1,16 @@
+# 忽略数据集文件夹
+humanml3d_272/
+
+# 可选：忽略其他常见不需要的文件
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.zip
+*.tar.gz
+*.pth
+*.pt
+*.ckpt
+.idea/
+.vscode/
+.DS_Store
