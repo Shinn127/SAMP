@@ -291,3 +291,462 @@ class MotionDDPM(nn.Module):
         device = x0.device
         t = torch.randint(0, self.timesteps, (b,), device=device).long()
         return self.p_losses(x0, x_cond, text, t, noise)
+    
+
+class MotionDiffusionTransformerDecoder(nn.Module):
+    def __init__(
+        self,
+        motion_dim=272,
+        num_frames=4,
+        cond_frames=13,
+        latent_dim=512,
+        ff_size=1024,
+        num_layers=6,
+        num_heads=8,
+        dropout=0.1,
+        clip_model="ViT-B/32",
+        use_x0_pred=True
+    ):
+        super().__init__()
+        self.motion_dim = motion_dim
+        self.num_frames = num_frames
+        self.cond_frames = cond_frames
+        self.latent_dim = latent_dim
+        self.use_x0_pred = use_x0_pred
+        self.device = None
+
+        # === 1. CLIP Text Encoder (frozen) ===
+        self.clip_model, _ = clip.load(clip_model, device="cpu", jit=False)
+        self.clip_model.eval()
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+        self.text_emb_dim = self.clip_model.text_projection.shape[1]  # 512
+
+        # === 2. Projection layers ===
+        self.text_proj = nn.Linear(self.text_emb_dim, latent_dim)      # text -> latent
+        self.motion_proj_in = nn.Linear(motion_dim, latent_dim)        # noisy motion -> latent
+        self.cond_proj = nn.Linear(motion_dim, latent_dim)             # condition x -> latent
+        self.time_proj = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )  # time embedding -> time token
+
+        # === 3. Positional embeddings ===
+        # Tokens: [time_token (1); x_cond (cond_frames); y_noisy (num_frames)]
+        self.total_query_tokens = 1 + cond_frames + num_frames
+        self.pos_emb = nn.Parameter(torch.randn(self.total_query_tokens, latent_dim))
+
+        # === 4. Transformer Decoder ===
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=latent_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_size,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+
+        # === 5. Output projection ===
+        self.motion_proj_out = nn.Linear(latent_dim, motion_dim)
+
+    def encode_text(self, text, device):
+        with torch.no_grad():
+            tokens = clip.tokenize(text, truncate=True).to(device)
+            text_emb = self.clip_model.encode_text(tokens).float()
+        return text_emb
+
+    def forward(self, y_noisy, t, x_cond, text):
+        """
+        Args:
+            y_noisy: [B, 4, 272]
+            t: [B]
+            x_cond: [B, 13, 272]
+            text: List[str]
+        Returns:
+            pred_x0: [B, 4, 272]
+        """
+        B = y_noisy.shape[0]
+        device = y_noisy.device
+
+        if self.device != device:
+            self.clip_model = self.clip_model.to(device)
+            self.device = device
+
+        # === 1. Encode text → [B, latent_dim] → memory ===
+        text_emb = self.encode_text(text, device)  # [B, 512]
+        text_emb = self.text_proj(text_emb)        # [B, latent_dim]
+        memory = text_emb.unsqueeze(1)             # [B, 1, latent_dim] ← memory for cross-attn
+
+        # === 2. Project motion inputs ===
+        x_emb = self.cond_proj(x_cond)             # [B, 13, latent_dim]
+        y_emb = self.motion_proj_in(y_noisy)       # [B, 4, latent_dim]
+
+        # === 3. Time embedding as a token ===
+        t_emb = timestep_embedding(t, self.latent_dim).to(device)  # [B, latent_dim]
+        time_token = self.time_proj(t_emb).unsqueeze(1)            # [B, 1, latent_dim]
+
+        # === 4. Concatenate query tokens: [time; x_cond; y_noisy] ===
+        query_tokens = torch.cat([time_token, x_emb, y_emb], dim=1)  # [B, 1+13+4=18, latent_dim]
+
+        # === 5. Add positional encoding to query tokens ===
+        query_tokens = query_tokens + self.pos_emb.unsqueeze(0)  # [B, 18, latent_dim]
+
+        # === 6. Transformer Decoder ===
+        # query: [B, 18, latent_dim]
+        # memory: [B, 1, latent_dim]
+        hidden = self.transformer_decoder(query_tokens, memory)    # [B, 18, latent_dim]
+
+        # === 7. Extract y part (last num_frames tokens) ===
+        y_out = hidden[:, -self.num_frames:]  # [B, 4, latent_dim]
+
+        # === 8. Project to motion space ===
+        pred = self.motion_proj_out(y_out)    # [B, 4, 272]
+        return pred
+    
+
+# ==============================
+# Diffusion Head: 接收 y_noisy + time + context
+# ==============================
+class DiffusionHead(nn.Module):
+    def __init__(self, motion_dim, num_frames, context_dim, hidden_dim=1024, num_layers=4):
+        super().__init__()
+        self.motion_dim = motion_dim
+        self.num_frames = num_frames
+        input_dim = motion_dim * num_frames + context_dim + context_dim  # y_flat + context + t_emb
+        layers = []
+        in_dim = input_dim
+        for i in range(num_layers - 1):
+            layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.SiLU()
+            ])
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, motion_dim * num_frames))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, y_noisy, context, t_emb):
+        # y_noisy: [B, F, D] → [B, F*D]
+        # context: [B, C]
+        # t_emb:   [B, C] （与 context 同维）
+        B = y_noisy.shape[0]
+        y_flat = y_noisy.view(B, -1)  # [B, F*D]
+        x = torch.cat([y_flat, context, t_emb], dim=-1)  # [B, F*D + C + C]
+        out = self.net(x)  # [B, F*D]
+        return out.view(B, self.num_frames, self.motion_dim)
+    
+
+# ==============================
+# 条件编码器：仅处理 text + x_cond
+# ==============================
+class MotionConditionTransformer(nn.Module):
+    def __init__(
+        self,
+        motion_dim=272,
+        cond_frames=13,
+        latent_dim=512,
+        ff_size=1024,
+        num_layers=6,
+        num_heads=8,
+        dropout=0.1,
+        clip_model="ViT-B/32"
+    ):
+        super().__init__()
+        self.motion_dim = motion_dim
+        self.cond_frames = cond_frames
+        self.latent_dim = latent_dim
+        self.device = None
+
+        # CLIP text encoder (frozen)
+        self.clip_model, _ = clip.load(clip_model, device="cpu", jit=False)
+        self.clip_model.eval()
+        for p in self.clip_model.parameters():
+            p.requires_grad = False
+        self.text_emb_dim = self.clip_model.text_projection.shape[1]
+
+        # Projections
+        self.text_proj = nn.Linear(self.text_emb_dim, latent_dim)
+        self.cond_proj = nn.Linear(motion_dim, latent_dim)
+
+        # Positional embedding for cond tokens + text token
+        total_tokens = 1 + cond_frames
+        self.pos_emb = nn.Parameter(torch.randn(total_tokens, latent_dim))
+
+        # Time is NOT in this encoder (handled in diffusion head)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_size,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Optional: global pooling or use [CLS]-like token
+        # We'll use average pooling over all tokens for context
+        # Or you can use the first (text) token as context
+
+    def encode_text(self, text, device):
+        with torch.no_grad():
+            tokens = clip.tokenize(text, truncate=True).to(device)
+            text_emb = self.clip_model.encode_text(tokens).float()
+        return text_emb
+
+    def forward(self, x_cond, text):
+        """
+        Encode condition (x_cond + text) into a global context vector.
+        Returns: context [B, latent_dim]
+        """
+        B = x_cond.shape[0]
+        device = x_cond.device
+
+        if self.device != device:
+            self.clip_model = self.clip_model.to(device)
+            self.device = device
+
+        # Text encoding
+        text_emb = self.encode_text(text, device)  # [B, 512]
+        text_emb = self.text_proj(text_emb)        # [B, latent_dim]
+        text_token = text_emb.unsqueeze(1)         # [B, 1, latent_dim]
+
+        # Condition encoding
+        x_emb = self.cond_proj(x_cond)             # [B, 13, latent_dim]
+
+        # Concat: [text; x_cond]
+        tokens = torch.cat([text_token, x_emb], dim=1)  # [B, 14, latent_dim]
+
+        # Add positional embedding
+        tokens = tokens + self.pos_emb.unsqueeze(0)
+
+        # Transformer
+        hidden = self.transformer(tokens)  # [B, 14, latent_dim]
+
+        # Option 1: Use text token as context (index 0)
+        context = hidden[:, 0]  # [B, latent_dim]
+
+        # Option 2: Mean pooling (uncomment if preferred)
+        # context = hidden.mean(dim=1)  # [B, latent_dim]
+
+        return context
+    
+
+# ==============================
+# 新的去噪网络：组合 condition encoder + diffusion head
+# ==============================
+class MotionDenoisingNetwork(nn.Module):
+    def __init__(
+        self,
+        motion_dim=272,
+        num_frames=4,
+        cond_frames=13,
+        latent_dim=512,
+        ff_size=1024,
+        num_layers=6,
+        num_heads=8,
+        dropout=0.1,
+        clip_model="ViT-B/32"
+    ):
+        super().__init__()
+        self.motion_dim = motion_dim
+        self.num_frames = num_frames
+        self.latent_dim = latent_dim
+
+        # Condition encoder (no y_noisy!)
+        self.condition_encoder = MotionConditionTransformer(
+            motion_dim=motion_dim,
+            cond_frames=cond_frames,
+            latent_dim=latent_dim,
+            ff_size=ff_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            clip_model=clip_model
+        )
+
+        # Time embedding MLP (output dim = latent_dim for alignment)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.SiLU(),
+            nn.Linear(latent_dim * 2, latent_dim)
+        )
+
+        # Diffusion head
+        self.diffusion_head = DiffusionHead(
+            motion_dim=motion_dim,
+            num_frames=num_frames,
+            context_dim=latent_dim,
+            hidden_dim=1024,
+            num_layers=4
+        )
+
+    def forward(self, y_noisy, t, x_cond, text):
+        """
+        y_noisy: [B, F, D] — current noisy target
+        t: [B] — time steps
+        x_cond: [B, 13, D] — past motion
+        text: List[str]
+        Returns: pred_x0 [B, F, D]
+        """
+        B = y_noisy.shape[0]
+        device = y_noisy.device
+
+        # 1. Encode condition (text + x_cond) → context
+        context = self.condition_encoder(x_cond, text)  # [B, latent_dim]
+
+        # 2. Time embedding
+        t_emb_raw = timestep_embedding(t, self.latent_dim).to(device)  # [B, latent_dim]
+        t_emb = self.time_mlp(t_emb_raw)  # [B, latent_dim]
+
+        # 3. Denoise with diffusion head
+        pred_x0 = self.diffusion_head(y_noisy, context, t_emb)  # [B, F, D]
+
+        return pred_x0
+    
+
+# ==============================
+# Transformer-based Diffusion Head (2-layer)
+# ==============================
+class TransformerDiffusionHead(nn.Module):
+    def __init__(
+        self,
+        motion_dim=272,
+        num_frames=4,
+        context_dim=512,
+        latent_dim=512,        # token dim inside head
+        num_layers=2,
+        num_heads=8,
+        ff_size=1024,
+        dropout=0.1
+    ):
+        super().__init__()
+        self.motion_dim = motion_dim
+        self.num_frames = num_frames
+        self.latent_dim = latent_dim
+
+        # Project y_noisy to latent space
+        self.motion_proj_in = nn.Linear(motion_dim, latent_dim)
+
+        # We'll add a "condition token" that fuses context + t_emb
+        self.cond_token_proj = nn.Linear(context_dim * 2, latent_dim)
+
+        # Positional embedding for y tokens (num_frames)
+        self.pos_emb_y = nn.Parameter(torch.randn(num_frames, latent_dim))
+        # No pos emb for cond token (it's global)
+
+        # 2-layer Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_size,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output projection
+        self.motion_proj_out = nn.Linear(latent_dim, motion_dim)
+
+    def forward(self, y_noisy, context, t_emb):
+        """
+        y_noisy: [B, F, D]
+        context: [B, C]
+        t_emb:   [B, C]
+        Returns: [B, F, D] — predicted x0
+        """
+        B = y_noisy.shape[0]
+        device = y_noisy.device
+
+        # 1. Project y_noisy to latent tokens
+        y_tokens = self.motion_proj_in(y_noisy)  # [B, F, latent_dim]
+        y_tokens = y_tokens + self.pos_emb_y.unsqueeze(0)  # add pos emb
+
+        # 2. Create a single conditioning token from [context; t_emb]
+        cond_token = torch.cat([context, t_emb], dim=-1)  # [B, 2*C]
+        cond_token = self.cond_token_proj(cond_token)     # [B, latent_dim]
+        cond_token = cond_token.unsqueeze(1)              # [B, 1, latent_dim]
+
+        # 3. Concatenate: [cond_token; y_tokens]
+        tokens = torch.cat([cond_token, y_tokens], dim=1)  # [B, 1+F, latent_dim]
+
+        # 4. Transformer encoder (2 layers)
+        hidden = self.transformer(tokens)  # [B, 1+F, latent_dim]
+
+        # 5. Extract y part (skip cond token)
+        y_out = hidden[:, 1:]  # [B, F, latent_dim]
+
+        # 6. Project back to motion space
+        pred = self.motion_proj_out(y_out)  # [B, F, motion_dim]
+
+        return pred
+    
+
+class TransformerMotionDenoisingNetwork(nn.Module):
+    def __init__(
+        self,
+        motion_dim=272,
+        num_frames=4,
+        cond_frames=13,
+        latent_dim=512,        # for condition encoder
+        ff_size=1024,
+        num_layers=6,
+        num_heads=8,
+        dropout=0.1,
+        clip_model="ViT-B/32"
+    ):
+        super().__init__()
+        self.motion_dim = motion_dim
+        self.num_frames = num_frames
+        self.latent_dim = latent_dim
+
+        # Condition encoder (text + x_cond → context)
+        self.condition_encoder = MotionConditionTransformer(
+            motion_dim=motion_dim,
+            cond_frames=cond_frames,
+            latent_dim=latent_dim,
+            ff_size=ff_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            clip_model=clip_model
+        )
+
+        # Time embedding MLP (output dim = latent_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.SiLU(),
+            nn.Linear(latent_dim * 2, latent_dim)
+        )
+
+        # ✅ Replace MLP head with 2-layer Transformer head
+        self.diffusion_head = TransformerDiffusionHead(
+            motion_dim=motion_dim,
+            num_frames=num_frames,
+            context_dim=latent_dim,
+            latent_dim=latent_dim,      # same as encoder for simplicity
+            num_layers=2,
+            num_heads=num_heads,
+            ff_size=ff_size,
+            dropout=dropout
+        )
+
+    def forward(self, y_noisy, t, x_cond, text):
+        B = y_noisy.shape[0]
+        device = y_noisy.device
+
+        # Encode condition
+        context = self.condition_encoder(x_cond, text)  # [B, latent_dim]
+
+        # Time embedding
+        t_emb_raw = timestep_embedding(t, self.latent_dim).to(device)
+        t_emb = self.time_mlp(t_emb_raw)  # [B, latent_dim]
+
+        # Denoise with transformer head
+        pred_x0 = self.diffusion_head(y_noisy, context, t_emb)  # [B, F, D]
+
+        return pred_x0
+    
+

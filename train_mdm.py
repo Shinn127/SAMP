@@ -8,6 +8,7 @@ import logging  # 👈 新增
 
 from dataset_v2 import TextMotionPredictionDataset, DATALoader
 from MDM import MotionDiffusionTransformer, MotionDDPM
+from MDM import MotionDenoisingNetwork, MotionDDPM, TransformerMotionDenoisingNetwork, MotionDiffusionTransformerDecoder
 
 # ======================
 # 设置日志
@@ -122,10 +123,10 @@ def main():
     # 模型初始化
     # ======================
     logger.info("Initializing DDPM model...")
-    denoise_net = MotionDiffusionTransformer(
+    denoise_net = MotionDiffusionTransformerDecoder(  # ✅ 使用新模型
         motion_dim=272,
         num_frames=4,
-        cond_frames=7,
+        cond_frames=7,      # 👈 确认这个数字与你的数据一致！
         latent_dim=512,
         ff_size=1024,
         num_layers=6,

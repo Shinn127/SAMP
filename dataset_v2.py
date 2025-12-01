@@ -192,7 +192,7 @@ class TextMotionPredictionDataset(data.Dataset):
         # 步骤7: 转换为 float32（PyTorch 默认精度）
         return (
             caption,
-            x.astype(np.float32),      # [13, 272]
+            x[:7].astype(np.float32),      # [13, 272]
             y.astype(np.float32),      # [4, 272]
             traj.astype(np.float32)    # [6, 36]
         )
