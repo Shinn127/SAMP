@@ -162,7 +162,7 @@ class TextMotionPredictionDataset(data.Dataset):
         }
 
         # 从x的前6帧构建轨迹特征（traj）
-        past_x = x[:6]  # [6, 272] ← 取最早6帧作为“历史轨迹”
+        past_x = x[:7]  # [6, 272] ← 取最早6帧作为“历史轨迹”
 
         traj_parts = []
         for name, joint_idx in joint_map.items():
