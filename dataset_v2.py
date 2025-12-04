@@ -15,11 +15,6 @@ class TextMotionPredictionDataset(data.Dataset):
         - x: 过去13帧归一化动作（用于条件）
         - y: 未来4帧归一化动作（预测目标，与x有重叠）
         - traj: 6个关键关节点在过去6帧的位置+速度（辅助轨迹特征）
-
-    修改说明：
-        - 不再只为每个动作 ID 保留第一个完整 caption；
-        - 所有满足 `#0.0#0.0` 的完整描述都会被加入样本列表；
-        - 每个 (motion, caption) 对视为一个独立样本，提升数据多样性。
     """
 
     def __init__(
@@ -44,28 +39,28 @@ class TextMotionPredictionDataset(data.Dataset):
             self.motion_dir = pjoin(self.data_root, 'motion_data')   # 动作 .npy 文件目录
             self.text_dir = pjoin(self.data_root, 'texts')           # 文本 .txt 文件目录
             self.fps = 30                                            # 帧率（30 FPS）
-            split_file = pjoin(self.data_root, 'split', f'{split}.txt')  # 划分文件路径（如 train.txt）
-            self.meta_dir = pjoin(self.data_root, 'mean_std')        # 归一化参数（均值和标准差）目录
+            split_file = pjoin(self.data_root, 'split', f'{split}.txt')  # 使用测试集划分
+            self.meta_dir = pjoin(self.data_root, 'mean_std')        # 归一化参数目录
         else:
             raise ValueError(f"Dataset {dataset_name} not supported. Only 't2m_272' is available.")
 
-        # 加载全局归一化参数（均值和标准差），用于将动作特征归一化到标准正态分布
+        # 加载动作数据的全局均值和标准差（用于归一化）
         self.mean = np.load(pjoin(self.meta_dir, 'Mean.npy'))  # shape: (272,)
         self.std = np.load(pjoin(self.meta_dir, 'Std.npy'))    # shape: (272,)
 
-        # 读取指定划分（如 train / val / test）中的动作 ID 列表
+        # 读取测试集 ID 列表（每个 ID 对应一个动作-文本对）
         with cs.open(split_file, 'r', encoding='utf-8') as f:
             id_list = [line.strip() for line in f.readlines()]
 
-        # 初始化样本列表：每个元素为字典 {'motion_path', 'caption', 'original_id'}
+        # 存储有效样本：每个元素为字典 {'motion_path', 'caption', 'original_id'}
         self.samples = []
 
-        # 遍历所有动作 ID，加载有效的（motion, caption）对
-        for name in tqdm(id_list, desc=f"Loading {split} samples"):
+        # 遍历所有 ID，加载有效样本
+        for name in tqdm(id_list, desc="Loading samples"):
             motion_path = pjoin(self.motion_dir, name + '.npy')
             text_path = pjoin(self.text_dir, name + '.txt')
 
-            # 若动作或文本文件缺失，跳过该 ID
+            # 跳过缺失文件的样本
             if not (os.path.exists(motion_path) and os.path.exists(text_path)):
                 continue
 
@@ -76,103 +71,87 @@ class TextMotionPredictionDataset(data.Dataset):
             except Exception as e:
                 continue  # 加载失败则跳过
 
-            # 跳过长度不足 min_seq_length 的动作序列（无法裁剪出14帧）
+            # 跳过长度不足 min_seq_length 的动作序列
             if T < self.min_seq_length:
                 continue
 
-            # 读取文本文件：每行格式为 "caption#parsed#start_time#end_time"
+            # 读取文本文件（每行格式：caption#xxx#start_time#end_time）
             with cs.open(text_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
-            # 遍历文本文件中的每一行
+            # 遍历所有文本描述行
             for line in lines:
-                line = line.strip()
-                if not line:
-                    continue  # 跳过空行
-
-                parts = line.split('#')
+                parts = line.strip().split('#')
                 if len(parts) < 4:
-                    continue  # 格式不合法，跳过
+                    continue  # 格式不合法则跳过
 
-                caption = parts[0]  # 原始自然语言描述
-                # 尝试解析起止时间（第3、4部分）
-                try:
-                    f_tag = float(parts[2]) if parts[2].strip() != '' else 0.0
-                    to_tag = float(parts[3]) if parts[3].strip() != '' else 0.0
-                except ValueError:
-                    continue  # 非法时间格式，跳过
+                caption = parts[0]
+                f_tag = float(parts[2]) if parts[2] else 0.0  # 起始时间（秒）
+                to_tag = float(parts[3]) if parts[3] else 0.0  # 结束时间（秒）
 
-                # 处理可能的 NaN（虽然罕见，但安全起见）
-                if np.isnan(f_tag):
-                    f_tag = 0.0
-                if np.isnan(to_tag):
-                    to_tag = 0.0
+                # 处理 NaN（罕见情况）
+                f_tag = 0.0 if np.isnan(f_tag) else f_tag
+                to_tag = 0.0 if np.isnan(to_tag) else to_tag
 
-                # 仅保留“完整动作”描述：即未指定时间片段（start=0.0, end=0.0）
+                # 只保留完整动作描述（即未指定时间范围的 caption）
                 if f_tag == 0.0 and to_tag == 0.0:
-                    # 将此 (motion, caption) 对作为一个独立样本加入列表
                     self.samples.append({
                         'motion_path': motion_path,
                         'caption': caption,
-                        'original_id': name
+                        'original_id': name  # 用于生成保存文件名
                     })
-                    # 注意：不再 break！继续处理该文件中的其他完整描述
-                    # 这样，一个动作文件可能对应多个样本（不同 caption）
+                    break  # 每个动作只取第一个完整描述
 
-        print(f"✅ Loaded {len(self.samples)} samples from {len(id_list)} IDs (min length >= {min_seq_length}).")
+        print(f"✅ Loaded {len(self.samples)} samples (min length >= {min_seq_length}).")
 
     def __len__(self):
-        """返回数据集总样本数（即 (motion, caption) 对的数量）"""
+        """返回数据集大小"""
         return len(self.samples)
 
     def __getitem__(self, idx):
         """
-        获取第 idx 个样本。
-        返回：
-            caption: str —— 当前样本对应的自然语言描述
-            x: [13, 272] —— 归一化的过去13帧动作（作为条件输入）
-            y: [4, 272]  —— 归一化的未来4帧动作（预测目标，与x重叠3帧）
-            traj: [6, 36] —— 6个关键关节点 × (位置3 + 速度3) × 6帧的历史轨迹特征
+        返回一个样本：
+            caption: str
+            x: [13, 272] → 归一化过去13帧（连续）
+            y: [4, 272]  → 归一化未来4帧（与x重叠后3帧）
+            traj: [6, 36] → 6个关键点 × (位置3 + 速度3) × 6帧
         """
-        # 从样本列表中获取当前样本信息
         sample = self.samples[idx]
-        motion = np.load(sample['motion_path'])     # 加载完整动作序列 [T, 272]
-        caption = sample['caption']                 # 对应的文本描述
-        original_id = sample['original_id']         # 原始动作ID（用于保存）
+        motion = np.load(sample['motion_path'])     # [T, 272]
+        caption = sample['caption']
+        original_id = sample['original_id']
 
         T = motion.shape[0]
 
         # 步骤1: 从原始动作中随机截取一段长度为 min_seq_length 的子序列
         if T > self.min_seq_length:
             start = random.randint(0, T - self.min_seq_length)
-            motion_seq = motion[start:start + self.min_seq_length]  # [min_seq_length, 272]
+            motion_seq = motion[start:start + self.min_seq_length]  # [L, 272], L = min_seq_length
         else:
-            motion_seq = motion  # 若长度刚好，直接使用全部
+            motion_seq = motion  # 若不足，则用全部
 
         # 步骤2: 从该子序列中再随机取连续14帧（用于构造x和y）
         start_14 = random.randint(0, self.min_seq_length - 14)
         motion_14 = motion_seq[start_14:start_14 + 14]  # [14, 272]
 
-        # 步骤3: 构造输入x（前13帧）和目标y（后4帧）
-        # 注意：x[10:13] 与 y[0:3] 重叠，符合序列预测设定
-        x_raw = motion_14[:13].copy()   # [13, 272]
-        y_raw = motion_14[-4:].copy()   # [4, 272]
+        # 步骤3: 构造输入x（13帧）和目标y（4帧）——注意：两者重叠（x[10:13] == y[0:3]）
+        x_raw = motion_14[:13].copy()   # [13, 272] ← 连续13帧作为条件
+        y_raw = motion_14[-4:].copy()   # [4, 272]  ← 最后4帧作为预测目标
 
-        # 步骤4: 使用全局均值和标准差对动作进行归一化
+        # 步骤4: 对x和y进行归一化
         x = (x_raw - self.mean) / self.std  # [13, 272]
         y = (y_raw - self.mean) / self.std  # [4, 272]
 
-        # 步骤5: 构建轨迹特征（traj）
-        # HumanML3D 272维动作向量的结构定义：
+        # 步骤5: 定义动作向量的语义结构（HumanML3D 272维）
         GLOBAL_DIM = 8          # 全局根节点信息（如根位置、根旋转等）
-        NUM_JOINTS = 22         # 总关节数
+        NUM_JOINTS = 22         # 关节数量
         JOINT_POS_DIM = 3       # 每个关节的位置维度 (x, y, z)
         JOINT_VEL_DIM = 3       # 每个关节的速度维度 (vx, vy, vz)
 
-        POS_START = GLOBAL_DIM                          # 关节位置起始索引 = 8
-        VEL_START = POS_START + NUM_JOINTS * JOINT_POS_DIM  # 速度起始索引 = 8 + 66 = 74
+        POS_START = GLOBAL_DIM                          # 关节位置起始索引: 8
+        VEL_START = POS_START + NUM_JOINTS * JOINT_POS_DIM  # 关节速度起始索引: 8 + 66 = 74
 
-        # 定义6个关键关节点（基于HumanML3D的22关节索引）
+        # 关注的6个关键关节点（索引基于22个关节点）
         joint_map = {
             'root': 0,          # 根节点
             'left_toe': 4,      # 左脚趾
@@ -182,17 +161,16 @@ class TextMotionPredictionDataset(data.Dataset):
             'right_hand': 21    # 右手
         }
 
-        # 使用x的前6帧（即 earliest 6 frames within the 13-frame window）构建轨迹
-        past_x = x[:6]  # [6, 272] ← 注意：取前6帧，不是7帧（原代码有误，已修正）
+        # 从x的前6帧构建轨迹特征（traj）
+        past_x = x[:7]  # [6, 272] ← 取最早6帧作为“历史轨迹”
 
-        # 为每个关键点提取位置和速度，拼接成 [6, 6] 特征
         traj_parts = []
-        for joint_name, joint_idx in joint_map.items():
-            # 计算该关节位置在272维中的起始索引
+        for name, joint_idx in joint_map.items():
+            # 计算该关节的位置起始索引
             pos_start = POS_START + joint_idx * JOINT_POS_DIM
             pos = past_x[:, pos_start:pos_start + JOINT_POS_DIM]  # [6, 3]
 
-            # 计算该关节速度在272维中的起始索引
+            # 计算该关节的速度起始索引
             vel_start = VEL_START + joint_idx * JOINT_VEL_DIM
             vel = past_x[:, vel_start:vel_start + JOINT_VEL_DIM]  # [6, 3]
 
@@ -200,41 +178,32 @@ class TextMotionPredictionDataset(data.Dataset):
             pos_vel = np.concatenate([pos, vel], axis=-1)
             traj_parts.append(pos_vel)
 
-        # 拼接6个关键点 → [6, 36]（6帧 × 6点 × 6维 = 6×36）
+        # 拼接所有关键点 → [6, 36]（6帧 × 6点 × 6维 = 6×36）
         traj = np.concatenate(traj_parts, axis=-1)  # [6, 36]
 
         # 步骤6（可选）: 保存原始未归一化的x_raw（13帧）及对应文本
         if self.save_original_npy_dir is not None:
             save_path = pjoin(self.save_original_npy_dir, f"{original_id}_{idx:06d}.npy")
-            np.save(save_path, x_raw)
-            # 同时保存文本描述（用于可视化或调试）
+            np.save(save_path, x_raw)  # 保存未归一化的13帧
+            # 同时保存文本描述
             with open(save_path.replace('.npy', '.txt'), 'w', encoding='utf-8') as f:
                 f.write(caption)
 
         # 步骤7: 转换为 float32（PyTorch 默认精度）
         return (
             caption,
-            x.astype(np.float32),      # [13, 272]
+            x[:7].astype(np.float32),      # [13, 272]
             y.astype(np.float32),      # [4, 272]
             traj.astype(np.float32)    # [6, 36]
         )
 
 
-def DATALoader(dataset_name, batch_size, num_workers=4, save_original_npy_dir=None, split='train'):
+def DATALoader(dataset_name, batch_size, num_workers=4, save_original_npy_dir=None):
     """
     构建数据加载器
-    参数：
-        dataset_name: 数据集名称（如 't2m_272'）
-        batch_size: 批大小
-        num_workers: 数据加载子进程数
-        save_original_npy_dir: 是否保存原始动作片段（用于可视化）
-        split: 数据划分（'train' / 'val' / 'test'）
-    返回：
-        dataloader: PyTorch DataLoader 对象
     """
     dataset = TextMotionPredictionDataset(
         dataset_name=dataset_name,
-        split=split,
         min_seq_length=30,
         save_original_npy_dir=save_original_npy_dir
     )
@@ -242,79 +211,14 @@ def DATALoader(dataset_name, batch_size, num_workers=4, save_original_npy_dir=No
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,          # 每个 epoch 打乱样本顺序（含不同 caption）
+        shuffle=True,          # 训练/评估时打乱顺序
         num_workers=num_workers,
-        drop_last=True,        # 丢弃最后一个不完整 batch
+        drop_last=True,        # 丢弃最后不足一个 batch 的样本
         collate_fn=lambda batch: (
-            [item[0] for item in batch],  # List[str]: 所有 caption
+            [item[0] for item in batch],  # List[str]: captions
             torch.stack([torch.from_numpy(item[1]) for item in batch], dim=0),  # [B, 13, 272]
             torch.stack([torch.from_numpy(item[2]) for item in batch], dim=0),  # [B, 4, 272]
             torch.stack([torch.from_numpy(item[3]) for item in batch], dim=0)   # [B, 6, 36]
         )
     )
     return dataloader
-
-
-# test_dataset.py
-
-def test_dataset():
-    print("🧪 正在测试 TextMotionPredictionDataset...")
-
-    # 创建数据集（使用 'val' 或 'test' 避免过长训练集）
-    dataset = TextMotionPredictionDataset(
-        dataset_name='t2m_272',
-        split='val',               # 建议用 val 或 test，样本少、加载快
-        min_seq_length=30,
-        save_original_npy_dir=None  # 不保存原始数据
-    )
-
-    print(f"✅ 数据集加载完成，共 {len(dataset)} 个样本")
-
-    # 测试单个样本
-    if len(dataset) == 0:
-        print("❌ 警告：数据集为空！请检查路径或 split 文件")
-        return
-
-    caption, x, y, traj = dataset[0]
-    print(f"\n📝 样本 0 的 caption: {caption}")
-    print(f"📊 x.shape: {x.shape} (应为 [13, 272])")
-    print(f"📊 y.shape: {y.shape} (应为 [4, 272])")
-    print(f"📊 traj.shape: {traj.shape} (应为 [6, 36])")
-
-    # 验证形状
-    assert x.shape == (13, 272), f"x 形状错误: {x.shape}"
-    assert y.shape == (4, 272), f"y 形状错误: {y.shape}"
-    assert traj.shape == (6, 36), f"traj 形状错误: {traj.shape}"
-    assert isinstance(caption, str), "caption 不是字符串"
-
-    print("\n✅ 单样本测试通过！")
-
-    # 测试 DataLoader（小 batch）
-    try:
-        dataloader = DATALoader(
-            dataset_name='t2m_272',
-            batch_size=2,
-            num_workers=0,      # 测试时设为0避免多进程问题
-            split='test'
-        )
-
-        batch = next(iter(dataloader))
-        captions, x_batch, y_batch, traj_batch = batch
-
-        print(f"\n📦 DataLoader batch 测试:")
-        print(f"   batch size: {len(captions)}")
-        print(f"   x_batch.shape: {x_batch.shape} (应为 [2, 13, 272])")
-        print(f"   y_batch.shape: {y_batch.shape} (应为 [2, 4, 272])")
-        print(f"   traj_batch.shape: {traj_batch.shape} (应为 [2, 6, 36])")
-
-        assert x_batch.shape == (2, 13, 272)
-        assert y_batch.shape == (2, 4, 272)
-        assert traj_batch.shape == (2, 6, 36)
-        print("\n✅ DataLoader 测试通过！")
-    except StopIteration:
-        print("⚠️  DataLoader 为空（样本数 < batch_size），跳过 batch 测试")
-
-    print("\n🎉 所有测试通过！数据集修改成功。")
-
-if __name__ == "__main__":
-    test_dataset()
