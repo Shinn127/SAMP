@@ -206,11 +206,11 @@ class SAMPriorVAE(nn.Module):
     """
     def __init__(self,
                  traj_dim: int = 36,
-                 z_dim: int = 256,
+                 z_dim: int = 512,
                  d_model: int = 128,
-                 nhead: int = 2,
+                 nhead: int = 4,
                  num_layers: int = 2,
-                 dropout: float = 0.1):
+                 dropout: float = 0.0):
         super().__init__()
         self.d_model = d_model
         seq_len = 2 + 7  # mu, logvar, 7 traj frames

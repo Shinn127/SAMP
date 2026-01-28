@@ -188,6 +188,9 @@ class TextMotionPredictionDataset(data.Dataset):
         # 使用x的前6帧（即 earliest 6 frames within the 13-frame window）构建轨迹
         past_x = x[:6]  # [6, 272]
 
+        # 提取每帧的前8维全局信息 → [6, 8]
+        global_features = past_x[:, :GLOBAL_DIM]  # shape: [6, 8]
+
         # 为每个关键点提取位置和速度，拼接成 [6, 6] 特征
         traj_parts = []
         for joint_name, joint_idx in joint_map.items():
@@ -203,8 +206,11 @@ class TextMotionPredictionDataset(data.Dataset):
             pos_vel = np.concatenate([pos, vel], axis=-1)
             traj_parts.append(pos_vel)
 
-        # 拼接6个关键点 → [6, 36]（6帧 × 6点 × 6维 = 6×36）
-        traj = np.concatenate(traj_parts, axis=-1)  # [6, 36]
+        # 拼接6个关键点 → [6, 36]
+        traj_base = np.concatenate(traj_parts, axis=-1)  # [6, 36]
+
+        # 将全局特征（[6,8]）拼接到每帧的轨迹特征后 → [6, 36+8] = [6, 44]
+        traj = np.concatenate([global_features, traj_base], axis=-1)  # [6, 44]
 
         # 步骤6（可选）: 保存原始未归一化的x_raw（13帧）及对应文本
         if self.save_original_npy_dir is not None:
@@ -220,7 +226,7 @@ class TextMotionPredictionDataset(data.Dataset):
             post.astype(np.float32),    # [13, 272]
             x.astype(np.float32),      # [7, 272]
             y.astype(np.float32),      # [7, 272]
-            traj.astype(np.float32)    # [6, 36]
+            traj.astype(np.float32)    # [6, 44]
         )
 
 
@@ -285,13 +291,13 @@ def test_dataset():
     print(f"📊 post.shape: {post.shape} (应为 [13, 272])")
     print(f"📊 x.shape: {x.shape} (应为 [7, 272])")
     print(f"📊 y.shape: {y.shape} (应为 [7, 272])")
-    print(f"📊 traj.shape: {traj.shape} (应为 [6, 36])")
+    print(f"📊 traj.shape: {traj.shape} (应为 [6, 44])")
 
     # 验证形状
     assert post.shape == (13, 272), f"post 形状错误: {post.shape}"
     assert x.shape == (7, 272), f"x 形状错误: {x.shape}"
     assert y.shape == (7, 272), f"y 形状错误: {y.shape}"
-    assert traj.shape == (6, 36), f"traj 形状错误: {traj.shape}"
+    assert traj.shape == (6, 44), f"traj 形状错误: {traj.shape}"
     assert isinstance(caption, str), "caption 不是字符串"
 
     print("\n✅ 单样本测试通过！")
@@ -313,12 +319,12 @@ def test_dataset():
         print(f"   post_batch.shape: {post_batch.shape} (应为 [2, 13, 272])")
         print(f"   x_batch.shape: {x_batch.shape} (应为 [2, 7, 272])")
         print(f"   y_batch.shape: {y_batch.shape} (应为 [2, 7, 272])")
-        print(f"   traj_batch.shape: {traj_batch.shape} (应为 [2, 6, 36])")
+        print(f"   traj_batch.shape: {traj_batch.shape} (应为 [2, 6, 44])")
 
         assert post_batch.shape == (2, 13, 272)
         assert x_batch.shape == (2, 7, 272)
         assert y_batch.shape == (2, 7, 272)
-        assert traj_batch.shape == (2, 6, 36)
+        assert traj_batch.shape == (2, 6, 44)
         print("\n✅ DataLoader 测试通过！")
     except StopIteration:
         print("⚠️  DataLoader 为空（样本数 < batch_size），跳过 batch 测试")
