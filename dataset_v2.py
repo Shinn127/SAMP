@@ -260,7 +260,7 @@ def DATALoader(dataset_name, batch_size, num_workers=8, save_original_npy_dir=No
             torch.stack([torch.from_numpy(item[1]) for item in batch], dim=0),  # [B, 13, 272]
             torch.stack([torch.from_numpy(item[2]) for item in batch], dim=0),  # [B, 7, 272]
             torch.stack([torch.from_numpy(item[3]) for item in batch], dim=0),  # [B, 7, 272]
-            torch.stack([torch.from_numpy(item[4]) for item in batch], dim=0)   # [B, 6, 36]
+            torch.stack([torch.from_numpy(item[4]) for item in batch], dim=0)   # [B, 6, 44]
         )
     )
     return dataloader
