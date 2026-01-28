@@ -1,6 +1,9 @@
 # 忽略数据集文件夹
 humanml3d_272/
-babel_272
+babel_272/
+anim/
+checkpoints_ddpm_t2m/
+motion/
 
 # 可选：忽略其他常见不需要的文件
 __pycache__/
