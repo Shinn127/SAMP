@@ -12,8 +12,9 @@ class TextMotionPredictionDataset(data.Dataset):
     文本-动作预测数据集
     输入：自然语言描述（caption）
     输出：
-        - x: 过去13帧归一化动作（用于条件）
-        - y: 未来4帧归一化动作（预测目标，与x有重叠）
+        - post: 过去现在未来13帧归一化动作（后验动作）
+        - x: 过去6帧+现在1帧归一化动作（输入）
+        - y: 未来5帧+现在1帧+未来1帧归一化动作（输出，与x有重叠）
         - traj: 6个关键关节点在过去6帧的位置+速度（辅助轨迹特征）
 
     修改说明：
@@ -130,8 +131,9 @@ class TextMotionPredictionDataset(data.Dataset):
         获取第 idx 个样本。
         返回：
             caption: str —— 当前样本对应的自然语言描述
-            x: [13, 272] —— 归一化的过去13帧动作（作为条件输入）
-            y: [4, 272]  —— 归一化的未来4帧动作（预测目标，与x重叠3帧）
+            post: [13, 272] 过去现在未来13帧归一化动作（后验动作）
+            x: [7, 272] 过去6帧+现在1帧归一化动作（输入）
+            y: [7, 272] 未来5帧+现在1帧+未来1帧归一化动作（输出，与x有重叠）
             traj: [6, 36] —— 6个关键关节点 × (位置3 + 速度3) × 6帧的历史轨迹特征
         """
         # 从样本列表中获取当前样本信息
@@ -149,18 +151,19 @@ class TextMotionPredictionDataset(data.Dataset):
         else:
             motion_seq = motion  # 若长度刚好，直接使用全部
 
-        # 步骤2: 从该子序列中再随机取连续14帧（用于构造x和y）
-        start_14 = random.randint(0, self.min_seq_length - 14)
-        motion_14 = motion_seq[start_14:start_14 + 14]  # [14, 272]
+        # 步骤2: 从该子序列中再随机取连续13帧（用于构造x和y）
+        start_13 = random.randint(0, self.min_seq_length - 13)
+        motion_13 = motion_seq[start_13:start_13 + 13]  # [13, 272]
 
-        # 步骤3: 构造输入x（前13帧）和目标y（后4帧）
-        # 注意：x[10:13] 与 y[0:3] 重叠，符合序列预测设定
-        x_raw = motion_14[:13].copy()   # [13, 272]
-        y_raw = motion_14[-4:].copy()   # [4, 272]
+        # 步骤3: 构造后验post输入x和目标y
+        post = motion_13.copy()      # [13, 272]
+        x_raw = motion_13[:7].copy()   # [7, 272]
+        y_raw = motion_13[1:8].copy()   # [7, 272]
 
         # 步骤4: 使用全局均值和标准差对动作进行归一化
-        x = (x_raw - self.mean) / self.std  # [13, 272]
-        y = (y_raw - self.mean) / self.std  # [4, 272]
+        post = (post - self.mean) / self.std  # [13, 272]
+        x = (x_raw - self.mean) / self.std  # [7, 272]
+        y = (y_raw - self.mean) / self.std  # [7, 272]
 
         # 步骤5: 构建轨迹特征（traj）
         # HumanML3D 272维动作向量的结构定义：
@@ -183,7 +186,7 @@ class TextMotionPredictionDataset(data.Dataset):
         }
 
         # 使用x的前6帧（即 earliest 6 frames within the 13-frame window）构建轨迹
-        past_x = x[:6]  # [6, 272] ← 注意：取前6帧，不是7帧（原代码有误，已修正）
+        past_x = x[:6]  # [6, 272]
 
         # 为每个关键点提取位置和速度，拼接成 [6, 6] 特征
         traj_parts = []
@@ -214,13 +217,14 @@ class TextMotionPredictionDataset(data.Dataset):
         # 步骤7: 转换为 float32（PyTorch 默认精度）
         return (
             caption,
-            x.astype(np.float32),      # [13, 272]
-            y.astype(np.float32),      # [4, 272]
+            post.astype(np.float32),    # [13, 272]
+            x.astype(np.float32),      # [7, 272]
+            y.astype(np.float32),      # [7, 272]
             traj.astype(np.float32)    # [6, 36]
         )
 
 
-def DATALoader(dataset_name, batch_size, num_workers=4, save_original_npy_dir=None, split='train'):
+def DATALoader(dataset_name, batch_size, num_workers=8, save_original_npy_dir=None, split='train'):
     """
     构建数据加载器
     参数：
@@ -248,8 +252,9 @@ def DATALoader(dataset_name, batch_size, num_workers=4, save_original_npy_dir=No
         collate_fn=lambda batch: (
             [item[0] for item in batch],  # List[str]: 所有 caption
             torch.stack([torch.from_numpy(item[1]) for item in batch], dim=0),  # [B, 13, 272]
-            torch.stack([torch.from_numpy(item[2]) for item in batch], dim=0),  # [B, 4, 272]
-            torch.stack([torch.from_numpy(item[3]) for item in batch], dim=0)   # [B, 6, 36]
+            torch.stack([torch.from_numpy(item[2]) for item in batch], dim=0),  # [B, 7, 272]
+            torch.stack([torch.from_numpy(item[3]) for item in batch], dim=0),  # [B, 7, 272]
+            torch.stack([torch.from_numpy(item[4]) for item in batch], dim=0)   # [B, 6, 36]
         )
     )
     return dataloader
@@ -275,15 +280,17 @@ def test_dataset():
         print("❌ 警告：数据集为空！请检查路径或 split 文件")
         return
 
-    caption, x, y, traj = dataset[0]
+    caption, post, x, y, traj = dataset[0]
     print(f"\n📝 样本 0 的 caption: {caption}")
-    print(f"📊 x.shape: {x.shape} (应为 [13, 272])")
-    print(f"📊 y.shape: {y.shape} (应为 [4, 272])")
+    print(f"📊 post.shape: {post.shape} (应为 [13, 272])")
+    print(f"📊 x.shape: {x.shape} (应为 [7, 272])")
+    print(f"📊 y.shape: {y.shape} (应为 [7, 272])")
     print(f"📊 traj.shape: {traj.shape} (应为 [6, 36])")
 
     # 验证形状
-    assert x.shape == (13, 272), f"x 形状错误: {x.shape}"
-    assert y.shape == (4, 272), f"y 形状错误: {y.shape}"
+    assert post.shape == (13, 272), f"post 形状错误: {post.shape}"
+    assert x.shape == (7, 272), f"x 形状错误: {x.shape}"
+    assert y.shape == (7, 272), f"y 形状错误: {y.shape}"
     assert traj.shape == (6, 36), f"traj 形状错误: {traj.shape}"
     assert isinstance(caption, str), "caption 不是字符串"
 
@@ -299,16 +306,18 @@ def test_dataset():
         )
 
         batch = next(iter(dataloader))
-        captions, x_batch, y_batch, traj_batch = batch
+        captions, post_batch, x_batch, y_batch, traj_batch = batch
 
         print(f"\n📦 DataLoader batch 测试:")
         print(f"   batch size: {len(captions)}")
-        print(f"   x_batch.shape: {x_batch.shape} (应为 [2, 13, 272])")
-        print(f"   y_batch.shape: {y_batch.shape} (应为 [2, 4, 272])")
+        print(f"   post_batch.shape: {post_batch.shape} (应为 [2, 13, 272])")
+        print(f"   x_batch.shape: {x_batch.shape} (应为 [2, 7, 272])")
+        print(f"   y_batch.shape: {y_batch.shape} (应为 [2, 7, 272])")
         print(f"   traj_batch.shape: {traj_batch.shape} (应为 [2, 6, 36])")
 
-        assert x_batch.shape == (2, 13, 272)
-        assert y_batch.shape == (2, 4, 272)
+        assert post_batch.shape == (2, 13, 272)
+        assert x_batch.shape == (2, 7, 272)
+        assert y_batch.shape == (2, 7, 272)
         assert traj_batch.shape == (2, 6, 36)
         print("\n✅ DataLoader 测试通过！")
     except StopIteration:
