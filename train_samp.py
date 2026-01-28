@@ -9,7 +9,7 @@ import logging
 
 # 👉 替换为您的 SAMP 模型（确保路径正确）
 from SAMP import SAMP_Framework  # 假设您的模型保存在 SAMP.py
-from dataset_v2 import TextMotionPredictionDataset, DATALoader
+from dataset_nfp import TextMotionPredictionDataset, DATALoader
 
 # ======================
 # 设置日志

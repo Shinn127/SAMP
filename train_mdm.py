@@ -6,7 +6,7 @@ import os
 from datetime import datetime
 import logging  # 👈 新增
 
-from dataset_v2 import TextMotionPredictionDataset, DATALoader
+from dataset_nfp import TextMotionPredictionDataset, DATALoader
 from MDM import MotionDiffusionTransformer, MotionDDPM
 from MDM import MotionDenoisingNetwork, MotionDDPM, TransformerMotionDenoisingNetwork, MotionDiffusionTransformerDecoder
 
