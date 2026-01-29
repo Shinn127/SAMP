@@ -547,10 +547,6 @@ class PriorLayer(nn.Module):
         return out
 
 
-
-import torch
-import torch.nn as nn
-
 # ----------------------------
 # 辅助组件：时间步嵌入
 # ----------------------------
@@ -614,17 +610,17 @@ class DiTBlock(nn.Module):
 class MotionDiffusionTransformer(nn.Module):
     def __init__(self, 
                  motion_dim=272, 
-                 latent_cond_dim=64, 
+                 latent_cond_dim=128, 
                  hidden_size=512, 
-                 nhead=8, 
-                 num_layers=8):
+                 nhead=4, 
+                 num_layers=2):
         super().__init__()
         self.motion_proj = nn.Linear(motion_dim, hidden_size)
         self.cond_proj = nn.Linear(latent_cond_dim, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         
         # RoPE 频率预计算 (假设预测 1 帧，但为了扩展性预留序列长度)
-        self.freqs_cis = precompute_freqs_cis(hidden_size // nhead, 1)
+        self.freqs_cis = precompute_freqs_cis(hidden_size // nhead, max_seq_len=8)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, nhead, 0.1) for _ in range(num_layers)
@@ -801,10 +797,10 @@ class SAMPFramework(nn.Module):
         self.diffusion_head = diffusion_head
 
     def forward(
-        self, 
-        motion_seq: torch.Tensor,   # [B, 13, motion_dim] (x_{-6:6})
-        past_traj: torch.Tensor,    # [B, 7, traj_dim] (x_{-6:0})
-        texts: List[str]
+        self,
+        texts: List[str],
+        motion_seq: torch.Tensor,   # [B, 13, motion_dim]
+        past_traj: torch.Tensor,    # [B, 6, traj_dim]
     ):
         """
         训练阶段 Pipeline
@@ -1061,10 +1057,52 @@ def test_sam_prior_vae():
         print(f"\n❌ 测试失败: {e}")
 
 
+def test_samp_framework():
+    print("开始集成测试: SAMPFramework...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 假设统一维度为 512 (根据你的 PriorVAE 设置)
+    z_dim = 512
+    motion_dim = 272
+    traj_dim = 44
+    
+    # 1. 模拟初始化子模块 (实际使用时替换为你的类实例)
+    # 注意：确保这些 mock 对象的输出维度相互匹配
+    framework = SAMPFramework(
+        text_encoder=DistilBERTTextEncoder(),
+        posterior_encoder=MotionPosteriorEncoder(motion_dim=motion_dim, z_dim=z_dim),
+        prior_vae=SAMPriorVAE(traj_dim=traj_dim, z_dim=z_dim),
+        latent_predictor=LatentMotionPredictor(z_dim=z_dim, motion_dim=motion_dim),
+        diffusion_head=nn.Identity() # 占位
+    ).to(device)
+
+    # 2. 构造输入
+    B = 2
+    texts = ["a person walks", "a person jumps"]
+    motion_seq = torch.randn(B, 13, motion_dim).to(device)
+    past_traj = torch.randn(B, 6, traj_dim).to(device)
+
+    # 3. 前向传播
+    try:
+        output = framework(texts, motion_seq, past_traj)
+        print("✅ 集成前向传播成功!")
+        for k, v in output.items():
+            if isinstance(v, torch.Tensor):
+                print(f"   - {k}: {v.shape}")
+    except Exception as e:
+        print(f"❌ 集成测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+
+
+
 
 
 if __name__ == '__main__':
     # test_distilbert_encoder()
-    test_motion_encoder()
-    test_latent_motion_predictor()
-    test_sam_prior_vae()
+    # test_motion_encoder()
+    # test_latent_motion_predictor()
+    # test_sam_prior_vae()
+    test_samp_framework()
