@@ -548,10 +548,48 @@ class PriorLayer(nn.Module):
 
 
 # ----------------------------
-# 辅助组件：时间步嵌入
+# 基础组件
 # ----------------------------
+class AdaLN(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x, shift, scale):
+        x = self.norm(x)
+        return x * (1 + scale) + shift
+
+
+class DiffusionMLPBlock(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.adaln1 = AdaLN(hidden_size)
+        self.adaln2 = AdaLN(hidden_size)
+
+        self.mlp1 = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+        self.mlp2 = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+
+        self.modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size)
+        )
+
+    def forward(self, x, c):
+        shift1, scale1, gate1, shift2, scale2, gate2 = self.modulation(c).chunk(6, dim=1)
+        x = x + gate1 * self.mlp1(self.adaln1(x, shift1, scale1))      
+        x = x + gate2 * self.mlp2(self.adaln2(x, shift2, scale2))      
+        return x
+
+
 class TimestepEmbedder(nn.Module):
-    """将标量时间步 t 转换为特征向量。"""
     def __init__(self, hidden_size):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -560,224 +598,144 @@ class TimestepEmbedder(nn.Module):
             nn.Linear(hidden_size, hidden_size),
         )
 
-    def forward(self, t, t_emb_input):
-        # t_emb_input 是预计算的正弦位置编码
+    def forward(self, t_emb_input: torch.Tensor) -> torch.Tensor:
         return self.mlp(t_emb_input)
 
-# ----------------------------
-# DiT Block: 带条件注入的 Transformer 层
-# ----------------------------
-class DiTBlock(nn.Module):
-    """
-    使用 Adaptive Layer Norm (adaLN) 注入条件的 Transformer 块。
-    公式: x = x + scale * Attention(norm(x)) + ...
-    """
-    def __init__(self, hidden_size, nhead, dropout):
+
+class MotionDiffusionMLP(nn.Module):
+    def __init__(self, motion_dim=272, latent_cond_dim=128, hidden_size=512, num_layers=4):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = MultiHeadAttention(hidden_size, nhead, dropout) # 复用之前的 MHA
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.ffn = SwiGLU(hidden_size)
-        
-        # adaLN 调制参数投影: 为 norm1 和 norm2 分别生成 scale, shift 和 gate
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
+        self.motion_dim = motion_dim
+        self.latent_cond_dim = latent_cond_dim
+        self.hidden_size = hidden_size
 
-    def forward(self, x, c, freqs_cis):
-        # 从条件向量 c 中预测调制参数
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
-            self.adaLN_modulation(c).chunk(6, dim=1)
-
-        # 调制 LayerNorm 1 并执行注意力
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            self.modulate(self.norm1(x), shift_msa, scale_msa), freqs_cis
-        )
-        # 调制 LayerNorm 2 并执行 FFN
-        x = x + gate_mlp.unsqueeze(1) * self.ffn(
-            self.modulate(self.norm2(x), shift_mlp, scale_mlp)
-        )
-        return x
-
-    def modulate(self, x, shift, scale):
-        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-
-# ----------------------------
-# 主模型：MotionDiffusionTransformer
-# ----------------------------
-class MotionDiffusionTransformer(nn.Module):
-    def __init__(self, 
-                 motion_dim=272, 
-                 latent_cond_dim=128, 
-                 hidden_size=512, 
-                 nhead=4, 
-                 num_layers=2):
-        super().__init__()
         self.motion_proj = nn.Linear(motion_dim, hidden_size)
         self.cond_proj = nn.Linear(latent_cond_dim, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        
-        # RoPE 频率预计算 (假设预测 1 帧，但为了扩展性预留序列长度)
-        self.freqs_cis = precompute_freqs_cis(hidden_size // nhead, max_seq_len=8)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, nhead, 0.1) for _ in range(num_layers)
+            DiffusionMLPBlock(hidden_size) for _ in range(num_layers)
         ])
-        
-        self.final_layer = nn.Sequential(
-            nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6),
-            nn.Linear(hidden_size, motion_dim)
-        )
-        # 最后的 adaLN 调制
+
+        self.final_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.final_linear = nn.Linear(hidden_size, motion_dim)
         self.final_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 2 * hidden_size)
         )
 
-    def forward(self, x_t, t, latent_motion, t_emb_sinusoidal):
-        """
-        Args:
-            x_t: [B, 1, 272] 当前加噪的动作
-            t: [B] 时间步
-            latent_motion: [B, 1, 64] 来自步骤 4 的条件
-            t_emb_sinusoidal: [B, hidden_size] 预计算的时间编码
-        """
-        # 1. 嵌入输入与条件
-        x = self.motion_proj(x_t) # [B, 1, d]
-        
-        # 融合时间信息与 latent_motion 作为全局条件 c
-        t_feat = self.t_embedder(t, t_emb_sinusoidal) # [B, d]
-        c_feat = self.cond_proj(latent_motion).squeeze(1) # [B, d]
-        c = t_feat + c_feat # 最终条件向量 [B, d]
+    def forward(self, x_t: torch.Tensor, t_embed: torch.Tensor, latent_motion: torch.Tensor) -> torch.Tensor:
+        x = self.motion_proj(x_t)
+        t_feat = self.t_embedder(t_embed)
+        c_feat = self.cond_proj(latent_motion)
+        c = t_feat + c_feat
 
-        # 2. Transformer 层处理
-        freqs_cis = self.freqs_cis.to(x.device)
         for block in self.blocks:
-            x = block(x, c, freqs_cis)
+            x = block(x, c)
 
-        # 3. 最终投影回动作空间
         shift, scale = self.final_modulation(c).chunk(2, dim=1)
-        x = self.final_layer[0](x) # Norm
-        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1) # Final modulation
-        return self.final_layer[1](x) # Linear to 272
-
+        x = self.final_norm(x)
+        x = x * (1 + scale) + shift
+        return self.final_linear(x)
 
 
 class X0DiffusionHead(nn.Module):
-    r"""
-    基于 x0 预测和 DDIM 采样算法的扩散模型头部。
-    支持 Cosine Schedule 和高效的短步数确定性采样。
-    """
-    def __init__(self, motion_dim: int, cond_dim: int = 0, num_steps: int = 8, s: float = 0.008):
+    def __init__(self, motion_dim: int = 272, cond_dim: int = 128, num_steps: int = 8, s: float = 0.008, hidden_size: int = 512):
         super().__init__()
         self.motion_dim = motion_dim
         self.cond_dim = cond_dim
         self.num_steps = num_steps
         self.s = s
+        self.hidden_size = hidden_size
 
-        # 1. 预计算 Cosine Alpha_bar (1000 steps 基础)
-        # Cosine schedule 相比 Linear schedule 在步数较少时能保留更多信息
         t_cont = torch.linspace(0, 1, 1001)
         alphas_cumprod = self._cosine_alpha_cumprod(t_cont, s)[:-1]
-        self.register_buffer('alphas_cumprod', torch.clamp(alphas_cumprod, 1e-8, 1-1e-8))
-
-        # 2. 采样时间步 (例如从 999 到 0 的均匀分布)
+        self.register_buffer('alphas_cumprod', torch.clamp(alphas_cumprod, 1e-8, 1 - 1e-8))
+        self.register_buffer('precomputed_t_emb', self._generate_timestep_embeddings(1000, hidden_size))
         self.register_buffer('sample_timesteps', torch.linspace(999, 0, num_steps).long())
-        
-        # 3. 内部去噪网络 (由外部定义)
-        # self.denoiser = X0Denoiser(motion_dim, cond_dim) 
+
+        self.denoiser = MotionDiffusionMLP(
+            motion_dim=motion_dim,
+            latent_cond_dim=cond_dim,
+            hidden_size=hidden_size,
+            num_layers=4
+        )
 
     def _cosine_alpha_cumprod(self, t: torch.Tensor, s: float) -> torch.Tensor:
         f_t = torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
         f_0 = math.cos(s / (1 + s) * math.pi / 2) ** 2
         return f_t / f_0
 
+    def _generate_timestep_embeddings(self, num_timesteps: int, dim: int) -> torch.Tensor:
+        half_dim = dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+        emb = torch.arange(num_timesteps, dtype=torch.float32).unsqueeze(1) * emb.unsqueeze(0)
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+        if dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
+
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """前向加噪过程: x_t = sqrt(alpha_bar) * x0 + sqrt(1 - alpha_bar) * noise"""
         if noise is None:
             noise = torch.randn_like(x0)
-        a = self.alphas_cumprod[t].view(-1, 1) # 适配维度
+        a = self.alphas_cumprod[t].view(-1, 1)
         return torch.sqrt(a) * x0 + torch.sqrt(1 - a) * noise
 
-    def training_loss(self, clean_motion: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """计算 MSE 损失: 直接预测原始信号 x0"""
-        B = clean_motion.shape[0]
+    def forward(self, clean_motion: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        B, T, _ = clean_motion.shape
         device = clean_motion.device
-        t = torch.randint(0, 1000, (B,), device=device).long()
-        noise = torch.randn_like(clean_motion)
-        
-        x_t = self.q_sample(clean_motion, t, noise)
-        x0_pred = self.denoiser(x_t, t, cond)
-        
-        return F.mse_loss(x0_pred, clean_motion)
+
+        clean_flat = clean_motion.view(B * T, -1)
+        cond_flat = cond.view(B * T, -1)
+
+        t_per_batch = torch.randint(0, 1000, (B,), device=device).long()
+        t_flat = t_per_batch.repeat_interleave(T)
+        t_emb_flat = self.precomputed_t_emb[t_flat]
+
+        noise = torch.randn_like(clean_flat)
+        x_t_flat = self.q_sample(clean_flat, t_flat, noise)
+        x0_pred_flat = self.denoiser(x_t_flat, t_emb_flat, cond_flat)
+
+        return x0_pred_flat, clean_flat
 
     @torch.no_grad()
-    def sample(self, cond: Optional[torch.Tensor] = None, batch_size: int = 1, eta: float = 0.0) -> torch.Tensor:
-        r"""
-        使用 DDIM 算法进行采样
-        Args:
-            cond: 条件张量
-            batch_size: 如果无条件，指定的 batch 大小
-            eta: 随机性缩放因子。eta=0 为确定性 DDIM，eta=1 为随机 DDPM。
-        """
-        B = cond.shape[0] if cond is not None else batch_size
-        device = cond.device if cond is not None else torch.device('cpu')
-        
-        # 从纯高斯噪声开始
-        x_t = torch.randn(B, self.motion_dim, device=device)
+    def sample(self, cond: torch.Tensor, eta: float = 0.0) -> torch.Tensor:
+        B, T, _ = cond.shape
+        device = cond.device
+        total_tokens = B * T
+
+        x_t_flat = torch.randn(total_tokens, self.motion_dim, device=device)
+        cond_flat = cond.view(total_tokens, -1)
+
         timesteps = self.sample_timesteps.to(device)
 
         for i, t in enumerate(timesteps):
             t_batch = t.repeat(B)
-            
-            # 模型直接预测 x0
-            x0_pred = self.denoiser(x_t, t_batch, cond)
+            t_flat = t_batch.repeat_interleave(T)
+            t_emb_flat = self.precomputed_t_emb[t_flat]
+
+            x0_pred_flat = self.denoiser(x_t_flat, t_emb_flat, cond_flat)
 
             if t == 0:
-                x_t = x0_pred
+                x_t_flat = x0_pred_flat
                 break
 
-            # 获取当前和前一个时间点的 alpha_bar
-            t_prev = timesteps[i+1] if i+1 < len(timesteps) else torch.tensor(0, device=device)
-            
+            t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
             ab_t = self.alphas_cumprod[t]
             ab_prev = self.alphas_cumprod[t_prev]
 
-            # --- DDIM 核心逻辑 ---
-            # 1. 根据 x_t 和预测的 x0 算出隐含的噪声 eps
-            # 公式由来: x_t = sqrt(ab_t)*x0 + sqrt(1-ab_t)*eps
-            eps_theta = (x_t - torch.sqrt(ab_t) * x0_pred) / torch.sqrt(1 - ab_t)
-
-            # 2. 计算随机性方差 sigma
-            # 若 eta=0，则 sigma=0，采样过程变为确定性
+            eps_theta = (x_t_flat - torch.sqrt(ab_t) * x0_pred_flat) / torch.sqrt(1 - ab_t)
             sigma = eta * torch.sqrt((1 - ab_prev) / (1 - ab_t)) * torch.sqrt(1 - ab_t / ab_prev)
-
-            # 3. 计算指向 x_{t-1} 的预测方向 (Predicted direction to x_t)
-            # 这里的方向是基于 eps_theta 指向当前噪声趋势
             dir_xt = torch.sqrt(1 - ab_prev - sigma**2) * eps_theta
-            
-            # 4. 组合得到 x_{t-1}
-            x_prev = torch.sqrt(ab_prev) * x0_pred + dir_xt
-            
+            x_prev = torch.sqrt(ab_prev) * x0_pred_flat + dir_xt
+
             if sigma > 0:
-                noise = torch.randn_like(x_t)
-                x_t = x_prev + sigma * noise
+                x_t_flat = x_prev + sigma * torch.randn_like(x_t_flat)
             else:
-                x_t = x_prev
+                x_t_flat = x_prev
 
-        return x_t
-
-
-
-
-
-
-
-
-
-
+        return x_t_flat.view(B, T, -1)
 
 
 class SAMPFramework(nn.Module):
@@ -787,7 +745,7 @@ class SAMPFramework(nn.Module):
         posterior_encoder: MotionPosteriorEncoder,   # MotionPosteriorEncoder
         prior_vae: SAMPriorVAE,           # SAMPriorVAE
         latent_predictor: LatentMotionPredictor,    # LatentMotionPredictor
-        diffusion_head: nn.Module,      # DiffusionHead
+        diffusion_head: X0DiffusionHead,      # DiffusionHead
     ):
         super().__init__()
         self.text_encoder = text_encoder
@@ -800,6 +758,8 @@ class SAMPFramework(nn.Module):
         self,
         texts: List[str],
         motion_seq: torch.Tensor,   # [B, 13, motion_dim]
+        x: torch.Tensor,            # [B, 7, motion_dim]
+        y: torch.Tensor,            # [B, 7, motion_dim]
         past_traj: torch.Tensor,    # [B, 6, traj_dim]
     ):
         """
@@ -822,13 +782,17 @@ class SAMPFramework(nn.Module):
 
         # 5. 潜在动作预测
         # 输入：z_final, past_motion (x_{-6:-1}), current_motion (x_0)
-        past_motion = motion_seq[:, :6, :]
-        curr_motion = motion_seq[:, 7, :]
+        past_motion = x[:, :6, :]
+        curr_motion = x[:, 6, :]
         
         latent_out = self.latent_predictor(z_final, past_motion, curr_motion)
 
+        x0_pred_flat, clean_flat = self.diffusion_head(y, latent_out[:, 1:, :].contiguous())
+
         return {
             "latent_out": latent_out,
+            "x0_pred_flat": x0_pred_flat,
+            "clean_flat": clean_flat,
             "mu_post": mu_post,
             "logvar_post": logvar_post,
             "mu_prior": mu_prior,
@@ -888,7 +852,14 @@ class SAMPFramework(nn.Module):
         # 计算两个高斯分布之间的 KL
         kl_loss = 0.5 * (torch.log(var_p/var_q) + (var_q + (mu_q - mu_p)**2)/var_p - 1).sum(dim=-1).mean()
 
-        return recon_loss + kl_weight * kl_loss
+        total_loss = recon_loss + kl_weight * kl_loss
+
+        # Optional diffusion reconstruction term if forward() output includes it.
+        if "x0_pred_flat" in out and "clean_flat" in out:
+            diff_loss = F.mse_loss(out["x0_pred_flat"], out["clean_flat"])
+            total_loss = total_loss + diff_loss
+
+        return total_loss
 
 
 
@@ -918,7 +889,7 @@ def test_distilbert_encoder():
         embeds = text_encoder.encode_texts(texts)
 
         # 5. 验证结果
-        expected_shape = (len(texts), 768)  # 预期输出维度
+        expected_shape = (len(texts), 512)  # 预期输出维度
         
         # 验证维度
         assert embeds.shape == expected_shape, f"维度错误: 预期 {expected_shape}, 实际 {embeds.shape}"
@@ -1073,18 +1044,20 @@ def test_samp_framework():
         posterior_encoder=MotionPosteriorEncoder(motion_dim=motion_dim, z_dim=z_dim),
         prior_vae=SAMPriorVAE(traj_dim=traj_dim, z_dim=z_dim),
         latent_predictor=LatentMotionPredictor(z_dim=z_dim, motion_dim=motion_dim),
-        diffusion_head=nn.Identity() # 占位
+        diffusion_head=X0DiffusionHead(motion_dim=272, cond_dim=128, num_steps=8, hidden_size=512)
     ).to(device)
 
     # 2. 构造输入
     B = 2
     texts = ["a person walks", "a person jumps"]
     motion_seq = torch.randn(B, 13, motion_dim).to(device)
+    x = torch.randn(B, 7, motion_dim).to(device)
+    y = torch.randn(B, 7, motion_dim).to(device)
     past_traj = torch.randn(B, 6, traj_dim).to(device)
 
     # 3. 前向传播
     try:
-        output = framework(texts, motion_seq, past_traj)
+        output = framework(texts, motion_seq, x, y, past_traj)
         print("✅ 集成前向传播成功!")
         for k, v in output.items():
             if isinstance(v, torch.Tensor):
@@ -1094,6 +1067,65 @@ def test_samp_framework():
         import traceback
         traceback.print_exc()
 
+
+def test_training_loss(
+    model: X0DiffusionHead,
+    batch_size: int = 32,
+    num_frames: int = 7,
+    motion_dim: int = 272,
+    cond_dim: int = 128,
+    device: torch.device = torch.device("cpu")
+) -> float:
+    """
+    测试训练损失计算是否正常。
+    
+    Args:
+        model: X0DiffusionHead 实例
+        batch_size: 批大小
+        num_frames: 每个样本的帧数
+        motion_dim: 运动数据维度
+        cond_dim: 条件维度
+        device: 设备
+    
+    Returns:
+        loss_value: 标量损失值
+    """
+    model.eval()  # 确保在 eval 模式下测试（无 dropout 等）
+    with torch.no_grad():
+        clean_motion = torch.randn(batch_size, num_frames, motion_dim, device=device)
+        cond = torch.randn(batch_size, num_frames, cond_dim, device=device)
+        x0_pred_flat, clean_flat = model(clean_motion, cond)
+        loss = F.mse_loss(x0_pred_flat, clean_flat)
+    return loss.item()
+
+
+def test_sampling(
+    model: X0DiffusionHead,
+    batch_size: int = 32,
+    num_frames: int = 7,
+    cond_dim: int = 128,
+    eta: float = 0.0,
+    device: torch.device = torch.device("cpu")
+) -> torch.Tensor:
+    """
+    测试采样过程是否正常。
+    
+    Args:
+        model: X0DiffusionHead 实例
+        batch_size: 批大小
+        num_frames: 每个样本的帧数
+        cond_dim: 条件维度
+        eta: DDIM 随机性参数
+        device: 设备
+    
+    Returns:
+        generated: 生成的运动数据 [B, T, motion_dim]
+    """
+    model.eval()
+    cond = torch.randn(batch_size, num_frames, cond_dim, device=device)
+    with torch.no_grad():
+        generated = model.sample(cond, eta=eta)
+    return generated
 
 
 
@@ -1106,3 +1138,24 @@ if __name__ == '__main__':
     # test_latent_motion_predictor()
     # test_sam_prior_vae()
     test_samp_framework()
+
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # # 初始化模型
+    # model = X0DiffusionHead(
+    #     motion_dim=272,
+    #     cond_dim=128,
+    #     num_steps=8,
+    #     hidden_size=512
+    # ).to(device)
+
+    # # 测试训练损失
+    # loss_val = test_training_loss(model, batch_size=32, num_frames=7, device=device)
+    # print(f"✅ Training loss: {loss_val:.6f}")
+
+    # # 测试采样
+    # generated = test_sampling(model, batch_size=32, num_frames=7, eta=0.0, device=device)
+    # print(f"✅ Sampling output shape: {generated.shape}")
+    # assert generated.shape == (32, 7, 272), "Sampling output shape mismatch!"
+
+    # print("🎉 All tests passed!")
