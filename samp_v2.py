@@ -273,7 +273,7 @@ class SAMPriorVAE(nn.Module):
         d_model: int = 128,
         n_heads: int = 4,
         num_layers: int = 2,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.traj_proj = nn.Linear(traj_dim, d_model)
@@ -348,8 +348,8 @@ class LatentMotionPredictor(nn.Module):
         z_dim: int = 512,
         motion_dim: int = 272,
         latent_dim: int = 128,
-        d_model: int = 512,
-        n_heads: int = 8,
+        d_model: int = 256,
+        n_heads: int = 4,
         num_layers: int = 2,
         dropout: float = 0.1,
         max_seq_len: int = 8,  # z + past6 + curr1
@@ -745,6 +745,7 @@ class SAMPFramework(nn.Module):
 # ============================================================
 def _smoke_test():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Running smoke test on device:", device)
     bsz = 2
     motion_dim = 272
     traj_dim = 44
@@ -773,7 +774,7 @@ def _smoke_test():
 
     out = model.forward_train(texts, motion_seq, x_hist, y_target, past_traj)
     losses = model.compute_loss(out)
-    print("smoke test ok:", {k: float(v) for k, v in losses.items()})
+    print("smoke test ok:", {k: v.item() for k, v in losses.items()})
 
 
 if __name__ == "__main__":

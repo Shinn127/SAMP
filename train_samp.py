@@ -1,264 +1,396 @@
-# -*- coding: utf-8 -*-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.amp import autocast, GradScaler
-import os
-from datetime import datetime
+import argparse
 import logging
+import os
+import random
+from datetime import datetime
+from typing import Dict, List, Tuple
 
-# 👉 替换为您的 SAMP 模型（确保路径正确）
-from SAMP import SAMP_Framework  # 假设您的模型保存在 SAMP.py
-from dataset_nfp import TextMotionPredictionDataset, DATALoader
+import numpy as np
+import torch
+from torch.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
 
-# ======================
-# 设置日志
-# ======================
-def setup_logger(log_dir="./logs"):
+from dataset_nfp import TextMotionPredictionDataset
+from samp_v2 import (
+    DistilBERTTextEncoder,
+    LatentMotionPredictor,
+    MotionPosteriorEncoder,
+    SAMPFramework,
+    SAMPriorVAE,
+    X0DiffusionHead,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train SAMP v2 with dataset_nfp")
+    parser.add_argument("--dataset_name", type=str, default="t2m_272")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--min_seq_length", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--kl_weight", type=float, default=1.0)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--save_every", type=int, default=20)
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_samp_v2")
+    parser.add_argument("--log_dir", type=str, default="./logs")
+    parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision on CUDA.")
+
+    parser.add_argument("--z_dim", type=int, default=512)
+    parser.add_argument("--latent_dim", type=int, default=128)
+    parser.add_argument("--motion_dim", type=int, default=272)
+    parser.add_argument("--traj_dim", type=int, default=44)
+
+    parser.add_argument("--resume", type=str, default="")
+    return parser.parse_args()
+
+
+def setup_logger(log_dir: str) -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"samp_train_{timestamp}.log")
+    log_path = os.path.join(log_dir, f"samp_v2_train_{timestamp}.log")
 
-    logger = logging.getLogger("SAMP_TrainLogger")
+    logger = logging.getLogger("samp_v2_train")
     logger.setLevel(logging.INFO)
-    if logger.hasHandlers():
-        logger.handlers.clear()
+    logger.handlers.clear()
 
-    console_handler = logging.StreamHandler()
-    file_handler = logging.FileHandler(log_file)
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    console_handler.setFormatter(formatter)
-    file_handler.setFormatter(formatter)
-
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(formatter)
+    logger.addHandler(sh)
+    logger.addHandler(fh)
     return logger
 
 
-def validate(model, val_loader, device, logger):
-    """在验证集上评估 SAMP 模型"""
-    model.eval()
-    total_loss = 0.0
-    total_diff_loss = 0.0
-    total_kl_loss = 0.0
-    count = 0
-
-    with torch.no_grad():
-        for batch in val_loader:
-            # 解包数据: (text, full_motion, future_motion, past_motion, current_motion, past_traj)
-            captions, x_full, y_future, x_past, x_curr, traj = batch
-            x_full = x_full.to(device, non_blocking=True)      # [B,13,272]
-            y_future = y_future.to(device, non_blocking=True)  # [B,4,272]
-            x_past = x_past.to(device, non_blocking=True)      # [B,6,272]
-            x_curr = x_curr.to(device, non_blocking=True)      # [B,1,272]
-            traj = traj.to(device, non_blocking=True)          # [B,7,36]
-
-            with autocast(device_type='cuda', enabled=torch.cuda.is_available()):
-                outputs = model(
-                    texts=captions,
-                    x_motion=x_full,
-                    future_motion=y_future,
-                    past_motion=x_past,
-                    current_motion=x_curr,
-                    past_traj=traj,
-                    mode='train'
-                )
-                loss_dict = model.loss_function(
-                    diffusion_loss=outputs['diffusion_loss'],
-                    mu_delta_post=outputs['mu_delta_post'],
-                    logvar_delta_post=outputs['logvar_delta_post'],
-                    mu_delta_prior=outputs['mu_delta_prior'],
-                    logvar_delta_prior=outputs['logvar_delta_prior'],
-                    lambda_kl=1.0,
-                    lambda_l2=0.1
-                )
-                total_loss += loss_dict['total_loss'].item()
-                total_diff_loss += loss_dict['diffusion_loss']
-                total_kl_loss += loss_dict['kl_delta']
-                count += 1
-
-    avg_total = total_loss / count
-    avg_diff = total_diff_loss / count
-    avg_kl = total_kl_loss / count
-    logger.info(f"  → Val Avg Loss: total={avg_total:.6f}, diff={avg_diff:.6f}, kl={avg_kl:.6f}")
-    return avg_total
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def main():
-    logger = setup_logger()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def collate_batch(
+    batch: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
+) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        [item[0] for item in batch],
+        torch.stack([torch.from_numpy(item[1]) for item in batch], dim=0),  # post: [B,13,272]
+        torch.stack([torch.from_numpy(item[2]) for item in batch], dim=0),  # x: [B,7,272]
+        torch.stack([torch.from_numpy(item[3]) for item in batch], dim=0),  # y: [B,7,272]
+        torch.stack([torch.from_numpy(item[4]) for item in batch], dim=0),  # traj: [B,6,44]
+    )
 
-    # ======================
-    # 超参数
-    # ======================
-    batch_size = 32
-    lr = 2e-4
-    weight_decay = 1e-4
-    num_epochs = 100
-    save_dir = './checkpoints_samp'
-    os.makedirs(save_dir, exist_ok=True)
 
-    # ======================
-    # 数据加载
-    # ======================
-    logger.info("Loading datasets...")
+def build_dataloaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     train_dataset = TextMotionPredictionDataset(
-        dataset_name='t2m_272',
-        min_seq_length=30,
-        split='train'
+        dataset_name=args.dataset_name,
+        split="train",
+        min_seq_length=args.min_seq_length,
     )
     val_dataset = TextMotionPredictionDataset(
-        dataset_name='t2m_272',
-        min_seq_length=30,
-        split='val'
+        dataset_name=args.dataset_name,
+        split="val",
+        min_seq_length=args.min_seq_length,
     )
 
-    # Collate 函数：确保输出 6 个元素
-    def collate_fn(batch):
-        # 假设 dataset 返回: (text, full_motion, future_motion, past_motion, current_motion, past_traj)
-        # full_motion: 13帧, future: 4帧, past:6, curr:1, traj:7×36
-        texts = [item[0] for item in batch]
-        x_full = torch.stack([torch.from_numpy(item[1]) for item in batch], dim=0)
-        y_future = torch.stack([torch.from_numpy(item[2]) for item in batch], dim=0)
-        traj = torch.stack([torch.from_numpy(item[3]) for item in batch], dim=0)
-        return texts, x_full, y_future, x_full[:, :6], x_full[:, 6:7], traj
+    use_cuda = torch.cuda.is_available()
+    common = {
+        "num_workers": args.num_workers,
+        "pin_memory": use_cuda,
+        "collate_fn": collate_batch,
+    }
+    if args.num_workers > 0:
+        common["persistent_workers"] = True
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=collate_fn
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        **common,
     )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, drop_last=False, collate_fn=collate_fn
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+        **common,
+    )
+    return train_loader, val_loader
+
+
+def build_model(args: argparse.Namespace) -> SAMPFramework:
+    return SAMPFramework(
+        text_encoder=DistilBERTTextEncoder(out_dim=args.z_dim),
+        posterior_encoder=MotionPosteriorEncoder(
+            motion_dim=args.motion_dim,
+            text_dim=args.z_dim,
+            z_dim=args.z_dim,
+        ),
+        prior_vae=SAMPriorVAE(
+            traj_dim=args.traj_dim,
+            z_dim=args.z_dim,
+        ),
+        latent_predictor=LatentMotionPredictor(
+            z_dim=args.z_dim,
+            motion_dim=args.motion_dim,
+            latent_dim=args.latent_dim,
+        ),
+        diffusion_head=X0DiffusionHead(
+            motion_dim=args.motion_dim,
+            cond_dim=args.latent_dim,
+            num_steps=8,
+        ),
     )
 
-    logger.info(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
 
-    # ======================
-    # 初始化 SAMP 模型
-    # ======================
-    logger.info("Initializing SAMP model...")
-    samp_model = SAMP_Framework(
-        joint_num=22,
-        clip_model_name="ViT-B/32",
-        z_dim=256,
-        device=device
-    ).to(device)
-
-    # ======================
-    # 优化器 & 混合精度
-    # ======================
-    optimizer = optim.AdamW(
-        samp_model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-        betas=(0.9, 0.99)
+def move_batch_to_device(
+    batch: Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    device: torch.device,
+) -> Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    texts, post, x_hist, y_target, past_traj = batch
+    return (
+        texts,
+        post.to(device, non_blocking=True),
+        x_hist.to(device, non_blocking=True),
+        y_target.to(device, non_blocking=True),
+        past_traj.to(device, non_blocking=True),
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    scaler = GradScaler('cuda', enabled=torch.cuda.is_available())
 
-    # ======================
-    # 训练循环
-    # ======================
-    logger.info("Start SAMP training...")
-    best_val_loss = float('inf')
-    global_step = 0
 
-    for epoch in range(num_epochs):
-        samp_model.train()
-        epoch_total_loss = 0.0
-        epoch_diff_loss = 0.0
-        epoch_kl_loss = 0.0
+def run_epoch(
+    model: SAMPFramework,
+    loader: DataLoader,
+    device: torch.device,
+    kl_weight: float,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    use_amp: bool,
+    grad_clip: float,
+    train: bool,
+    log_interval: int,
+    logger: logging.Logger,
+    epoch: int,
+    total_epochs: int,
+) -> Dict[str, float]:
+    if train:
+        model.train()
+    else:
+        model.eval()
 
-        for batch_idx, (captions, x_full, y_future, x_past, x_curr, traj) in enumerate(train_loader):
-            # 移至 GPU
-            x_full = x_full.to(device, non_blocking=True)
-            y_future = y_future.to(device, non_blocking=True)
-            x_past = x_past.to(device, non_blocking=True)
-            x_curr = x_curr.to(device, non_blocking=True)
-            traj = traj.to(device, non_blocking=True)
+    total_loss_sum = 0.0
+    diff_loss_sum = 0.0
+    kl_loss_sum = 0.0
+    num_steps = 0
 
-            optimizer.zero_grad()
+    for step, batch in enumerate(loader):
+        texts, post, x_hist, y_target, past_traj = move_batch_to_device(batch, device)
 
-            with autocast(device_type='cuda', enabled=torch.cuda.is_available()):
-                # 前向传播（训练模式）
-                outputs = samp_model(
-                    texts=captions,
-                    x_motion=x_full,
-                    future_motion=y_future,
-                    past_motion=x_past,
-                    current_motion=x_curr,
-                    past_traj=traj,
-                    mode='train'
+        with torch.set_grad_enabled(train):
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+
+            with autocast(device_type="cuda", enabled=(use_amp and device.type == "cuda")):
+                out = model.forward_train(
+                    texts=texts,
+                    motion_seq=post,
+                    x_hist=x_hist,
+                    y_target=y_target,
+                    past_traj=past_traj,
                 )
+                losses = model.compute_loss(out, kl_weight=kl_weight)
+                total_loss = losses["total_loss"]
 
-                # 计算复合损失
-                loss_dict = samp_model.loss_function(
-                    diffusion_loss=outputs['diffusion_loss'],
-                    mu_delta_post=outputs['mu_delta_post'],
-                    logvar_delta_post=outputs['logvar_delta_post'],
-                    mu_delta_prior=outputs['mu_delta_prior'],
-                    logvar_delta_prior=outputs['logvar_delta_prior'],
-                    lambda_kl=1.0,
-                    lambda_l2=1.0
-                )
-                total_loss = loss_dict['total_loss']
+            if train:
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
 
-            # 反向传播
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(samp_model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+        total_loss_sum += float(total_loss.detach().item())
+        diff_loss_sum += float(losses["diff_loss"].item())
+        kl_loss_sum += float(losses["kl_loss"].item())
+        num_steps += 1
 
-            # 累计损失
-            epoch_total_loss += total_loss.item()
-            epoch_diff_loss += loss_dict['diffusion_loss']
-            epoch_kl_loss += loss_dict['kl_delta']
-            global_step += 1
+        if train and (step % log_interval == 0):
+            logger.info(
+                "Epoch %d/%d Step %d/%d | total=%.6f diff=%.6f kl=%.6f",
+                epoch + 1,
+                total_epochs,
+                step,
+                len(loader) - 1,
+                float(total_loss.detach().item()),
+                float(losses["diff_loss"].item()),
+                float(losses["kl_loss"].item()),
+            )
 
-            if batch_idx % 50 == 0:
-                logger.info(
-                    f"Epoch {epoch+1}/{num_epochs} | Step {batch_idx} | "
-                    f"Total: {total_loss.item():.6f} | Diff: {loss_dict['diffusion_loss']:.6f} | KL: {loss_dict['kl_delta']:.6f} | L2: {loss_dict['l2_mean']:.6f}"
-                )
+    if num_steps == 0:
+        return {"total_loss": 0.0, "diff_loss": 0.0, "kl_loss": 0.0}
 
-        # Epoch 结束
-        avg_train_total = epoch_total_loss / len(train_loader)
-        avg_train_diff = epoch_diff_loss / len(train_loader)
-        avg_train_kl = epoch_kl_loss / len(train_loader)
+    return {
+        "total_loss": total_loss_sum / num_steps,
+        "diff_loss": diff_loss_sum / num_steps,
+        "kl_loss": kl_loss_sum / num_steps,
+    }
+
+
+def save_checkpoint(
+    path: str,
+    model: SAMPFramework,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    scaler: GradScaler,
+    epoch: int,
+    best_val_loss: float,
+) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "best_val_loss": best_val_loss,
+        },
+        path,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    logger = setup_logger(args.log_dir)
+    set_seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = args.amp and device.type == "cuda"
+
+    logger.info("Device: %s | AMP: %s", device, use_amp)
+    logger.info("Building dataloaders...")
+    train_loader, val_loader = build_dataloaders(args)
+    logger.info("Train steps/epoch: %d | Val steps: %d", len(train_loader), len(val_loader))
+
+    logger.info("Building model...")
+    model = build_model(args).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.99),
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = GradScaler("cuda", enabled=use_amp)
+
+    start_epoch = 0
+    best_val_loss = float("inf")
+    if args.resume:
+        logger.info("Resuming from %s", args.resume)
+        ckpt = torch.load(args.resume, map_location="cpu")
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+        start_epoch = int(ckpt["epoch"]) + 1
+        best_val_loss = float(ckpt.get("best_val_loss", best_val_loss))
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    logger.info("Start training for %d epochs...", args.epochs)
+    for epoch in range(start_epoch, args.epochs):
+        train_metrics = run_epoch(
+            model=model,
+            loader=train_loader,
+            device=device,
+            kl_weight=args.kl_weight,
+            optimizer=optimizer,
+            scaler=scaler,
+            use_amp=use_amp,
+            grad_clip=args.grad_clip,
+            train=True,
+            log_interval=args.log_interval,
+            logger=logger,
+            epoch=epoch,
+            total_epochs=args.epochs,
+        )
+
+        val_metrics = run_epoch(
+            model=model,
+            loader=val_loader,
+            device=device,
+            kl_weight=args.kl_weight,
+            optimizer=optimizer,
+            scaler=scaler,
+            use_amp=use_amp,
+            grad_clip=args.grad_clip,
+            train=False,
+            log_interval=args.log_interval,
+            logger=logger,
+            epoch=epoch,
+            total_epochs=args.epochs,
+        )
         scheduler.step()
 
-        logger.info(f"Epoch {epoch+1} | Train Avg → Total: {avg_train_total:.6f}, Diff: {avg_train_diff:.6f}, KL: {avg_train_kl:.6f}")
+        logger.info(
+            "Epoch %d/%d | train(total=%.6f diff=%.6f kl=%.6f) | val(total=%.6f diff=%.6f kl=%.6f) | lr=%.6e",
+            epoch + 1,
+            args.epochs,
+            train_metrics["total_loss"],
+            train_metrics["diff_loss"],
+            train_metrics["kl_loss"],
+            val_metrics["total_loss"],
+            val_metrics["diff_loss"],
+            val_metrics["kl_loss"],
+            optimizer.param_groups[0]["lr"],
+        )
 
-        # 验证
-        logger.info("Running validation...")
-        avg_val_loss = validate(samp_model, val_loader, device, logger)
+        latest_path = os.path.join(args.output_dir, "latest.pth")
+        save_checkpoint(
+            latest_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=epoch,
+            best_val_loss=best_val_loss,
+        )
 
-        # 保存最佳模型
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            best_ckpt_path = os.path.join(save_dir, "samp_best.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': samp_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'train_total_loss': avg_train_total,
-            }, best_ckpt_path)
-            logger.info(f"New best model saved (Val Loss: {avg_val_loss:.6f})")
+        if val_metrics["total_loss"] < best_val_loss:
+            best_val_loss = val_metrics["total_loss"]
+            best_path = os.path.join(args.output_dir, "best.pth")
+            save_checkpoint(
+                best_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                best_val_loss=best_val_loss,
+            )
+            logger.info("Saved new best checkpoint: %s", best_path)
 
-        # 定期保存
-        if (epoch + 1) % 20 == 0:
-            ckpt_path = os.path.join(save_dir, f"samp_epoch{epoch+1:03d}.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': samp_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'train_total_loss': avg_train_total,
-            }, ckpt_path)
-            logger.info(f"Periodic checkpoint saved: {ckpt_path}")
+        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            periodic_path = os.path.join(args.output_dir, f"epoch_{epoch + 1:03d}.pth")
+            save_checkpoint(
+                periodic_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                best_val_loss=best_val_loss,
+            )
+            logger.info("Saved periodic checkpoint: %s", periodic_path)
 
-    logger.info(f"Training completed! Best validation loss: {best_val_loss:.6f}")
+    logger.info("Training finished. Best val total loss: %.6f", best_val_loss)
 
 
 if __name__ == "__main__":

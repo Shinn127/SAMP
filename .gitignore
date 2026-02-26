@@ -7,6 +7,7 @@ babel_272/
 anim/
 checkpoints_ddpm_t2m/
 motion/
+checkpoints_ddpm_t2m/
 
 # 可选：忽略其他常见不需要的文件
 __pycache__/
