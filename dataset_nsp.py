@@ -12,11 +12,13 @@ class TextMotionPredictionDataset(data.Dataset):
         self,
         dataset_name,
         min_seq_length=121,
-        save_original_npy_dir=None  # 👈 新增参数：保存原始121帧的目录
+        save_original_npy_dir=None,  # 👈 新增参数：保存原始121帧的目录
+        split='test'
     ):
         self.dataset_name = dataset_name
         self.min_seq_length = min_seq_length
         self.save_original_npy_dir = save_original_npy_dir
+        self.split = split
 
         if save_original_npy_dir and not os.path.exists(save_original_npy_dir):
             os.makedirs(save_original_npy_dir)
@@ -26,7 +28,7 @@ class TextMotionPredictionDataset(data.Dataset):
             self.motion_dir = pjoin(self.data_root, 'motion_data')
             self.text_dir = pjoin(self.data_root, 'texts')
             self.fps = 30
-            split_file = pjoin(self.data_root, 'split', 'test.txt')
+            split_file = pjoin(self.data_root, 'split', f'{split}.txt')
             self.meta_dir = pjoin(self.data_root, 'mean_std')
         else:
             raise ValueError(f"Dataset {dataset_name} not supported")
@@ -36,7 +38,7 @@ class TextMotionPredictionDataset(data.Dataset):
         self.std = np.load(pjoin(self.meta_dir, 'Std.npy'))    # (272,)
 
         # Load split IDs
-        with cs.open(split_file, 'r') as f:
+        with cs.open(split_file, 'r', encoding='utf-8') as f:
             id_list = [line.strip() for line in f.readlines()]
 
         self.samples = []  # (motion_path, caption, original_id)
@@ -57,16 +59,23 @@ class TextMotionPredictionDataset(data.Dataset):
             if T < self.min_seq_length:
                 continue
 
-            with cs.open(text_path, 'r') as f:
+            with cs.open(text_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
             for line in lines:
-                parts = line.strip().split('#')
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = line.split('#')
                 if len(parts) < 4:
                     continue
                 caption = parts[0]
-                f_tag = float(parts[2]) if parts[2] else 0.0
-                to_tag = float(parts[3]) if parts[3] else 0.0
+                try:
+                    f_tag = float(parts[2]) if parts[2].strip() != '' else 0.0
+                    to_tag = float(parts[3]) if parts[3].strip() != '' else 0.0
+                except ValueError:
+                    continue
                 f_tag = 0.0 if np.isnan(f_tag) else f_tag
                 to_tag = 0.0 if np.isnan(to_tag) else to_tag
 
@@ -76,7 +85,6 @@ class TextMotionPredictionDataset(data.Dataset):
                         'caption': caption,
                         'original_id': name  # 用于生成保存文件名
                     })
-                    break
 
         print(f"✅ Loaded {len(self.samples)} samples (min length >= {min_seq_length}).")
 
@@ -162,10 +170,11 @@ class TextMotionPredictionDataset(data.Dataset):
         )
 
 
-def DATALoader(dataset_name, batch_size, num_workers=4, save_original_npy_dir=None):
+def DATALoader(dataset_name, batch_size, num_workers=4, save_original_npy_dir=None, split='test'):
     dataset = TextMotionPredictionDataset(
         dataset_name=dataset_name,
-        save_original_npy_dir=save_original_npy_dir
+        save_original_npy_dir=save_original_npy_dir,
+        split=split
     )
     dataloader = torch.utils.data.DataLoader(
         dataset,
