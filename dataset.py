@@ -201,13 +201,23 @@ class TextMotionGenerationDataset(data.Dataset):
 
     每个样本返回：
     - caption: str
-    - motion_13: [13, 272]，随机裁剪的连续13帧（归一化后）
+    - motion: [196, 272]，按 unit_length 规则裁剪并补零后的序列（归一化后）
     """
 
-    def __init__(self, dataset_name, split='train', min_seq_length=30):
+    def __init__(
+        self,
+        dataset_name,
+        split='train',
+        min_seq_length=30,
+        max_motion_length=196,
+        unit_length=4,
+    ):
         self.dataset_name = dataset_name
         self.split = split
         self.min_seq_length = min_seq_length
+        self.max_motion_length = max_motion_length
+        self.unit_length = unit_length
+        self._max_motion_seq_length = 0
 
         if dataset_name == 't2m_272':
             self.data_root = './humanml3d_272'
@@ -239,6 +249,7 @@ class TextMotionGenerationDataset(data.Dataset):
 
             if T < self.min_seq_length:
                 continue
+            self._max_motion_seq_length = max(self._max_motion_seq_length, T)
 
             with cs.open(text_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
@@ -276,6 +287,12 @@ class TextMotionGenerationDataset(data.Dataset):
             f"(min length >= {min_seq_length})."
         )
 
+    def get_max_motion_seq_length(self):
+        """
+        返回当前数据集（已过滤 min_seq_length 后）中 motion 的最大序列长度（帧数）。
+        """
+        return self._max_motion_seq_length
+
     def __len__(self):
         return len(self.samples)
 
@@ -285,17 +302,26 @@ class TextMotionGenerationDataset(data.Dataset):
         caption = sample['caption']
 
         T = motion.shape[0]
-        if T > self.min_seq_length:
-            start = random.randint(0, T - self.min_seq_length)
-            motion_seq = motion[start:start + self.min_seq_length]
+
+        if T > self.max_motion_length:
+            if random.random() < 2.0 / 3.0:
+                m_length = self.max_motion_length
+            else:
+                m_length = self.max_motion_length - self.unit_length
+            start = random.randint(0, T - m_length)
+            motion_seq = motion[start:start + m_length]
         else:
+            m_length = T
             motion_seq = motion
 
-        start_13 = random.randint(0, self.min_seq_length - 13)
-        motion_13 = motion_seq[start_13:start_13 + 13]
-        motion_13 = (motion_13 - self.mean) / self.std
+        motion_seq = (motion_seq - self.mean) / self.std
 
-        return caption, motion_13.astype(np.float32)
+        if m_length < self.max_motion_length:
+            pad_len = self.max_motion_length - m_length
+            pad = np.zeros((pad_len, motion_seq.shape[1]), dtype=motion_seq.dtype)
+            motion_seq = np.concatenate([motion_seq, pad], axis=0)
+
+        return caption, motion_seq.astype(np.float32)
 
 
 def DATALoader(dataset_name, batch_size, num_workers=8, save_original_npy_dir=None, split='train'):
@@ -323,11 +349,21 @@ def DATALoader(dataset_name, batch_size, num_workers=8, save_original_npy_dir=No
     return dataloader
 
 
-def DATALoaderGeneration(dataset_name, batch_size, num_workers=8, split='train'):
+def DATALoaderGeneration(
+    dataset_name,
+    batch_size,
+    num_workers=8,
+    split='train',
+    min_seq_length=30,
+    max_motion_length=196,
+    unit_length=4,
+):
     dataset = TextMotionGenerationDataset(
         dataset_name=dataset_name,
         split=split,
-        min_seq_length=30,
+        min_seq_length=min_seq_length,
+        max_motion_length=max_motion_length,
+        unit_length=unit_length,
     )
 
     dataloader = torch.utils.data.DataLoader(
@@ -403,10 +439,13 @@ def test_dataset():
 def test_generation_dataset():
     print('🧪 Testing TextMotionGenerationDataset...')
 
+    max_motion_length = 196
     dataset = TextMotionGenerationDataset(
         dataset_name='t2m_272',
         split='val',
         min_seq_length=30,
+        max_motion_length=max_motion_length,
+        unit_length=4,
     )
 
     print(f'✅ Generation dataset loaded: {len(dataset)} samples')
@@ -415,12 +454,40 @@ def test_generation_dataset():
         print('❌ Empty generation dataset. Check paths/split files.')
         return
 
-    caption, motion_13 = dataset[0]
+    # 1) 基础输出检查
+    caption, motion_seq = dataset[0]
     print(f'caption: {caption}')
-    print(f'motion_13.shape: {motion_13.shape}')
-
+    print(f'motion_seq.shape: {motion_seq.shape}')
     assert isinstance(caption, str)
-    assert motion_13.shape == (13, 272)
+    assert motion_seq.shape == (max_motion_length, 272)
+    assert motion_seq.dtype == np.float32
+
+    # 2) 最大长度统计检查（与样本列表中真实最大 T 一致）
+    computed_max_t = 0
+    has_short_sample = False
+    short_sample_idx = None
+    short_sample_len = None
+    for i, sample in enumerate(dataset.samples):
+        t = np.load(sample['motion_path']).shape[0]
+        computed_max_t = max(computed_max_t, t)
+        if (not has_short_sample) and (dataset.min_seq_length <= t < max_motion_length):
+            has_short_sample = True
+            short_sample_idx = i
+            short_sample_len = t
+
+    print(f'max_motion_seq_length(dataset): {dataset.get_max_motion_seq_length()}')
+    print(f'max_motion_seq_length(computed): {computed_max_t}')
+    assert dataset.get_max_motion_seq_length() == computed_max_t
+
+    # 3) 补零检查：若存在短序列，尾部 padding 必须全 0
+    if has_short_sample:
+        _, short_motion = dataset[short_sample_idx]
+        tail = short_motion[short_sample_len:]
+        assert tail.shape[0] == max_motion_length - short_sample_len
+        assert np.allclose(tail, 0.0), 'Padding region should be all zeros.'
+        print(f'padding check passed for sample idx={short_sample_idx}, raw_len={short_sample_len}')
+    else:
+        print('⚠️ No short sample in this split to verify zero-padding behavior.')
 
     try:
         dataloader = DATALoaderGeneration(
@@ -428,6 +495,9 @@ def test_generation_dataset():
             batch_size=2,
             num_workers=0,
             split='val',
+            min_seq_length=30,
+            max_motion_length=max_motion_length,
+            unit_length=4,
         )
         captions, motion_batch = next(iter(dataloader))
 
@@ -436,7 +506,7 @@ def test_generation_dataset():
         print(f'  motion_batch.shape: {motion_batch.shape}')
 
         assert len(captions) == 2
-        assert motion_batch.shape == (2, 13, 272)
+        assert motion_batch.shape == (2, max_motion_length, 272)
     except StopIteration:
         print('⚠️ Generation DataLoader is empty (< batch_size).')
 

@@ -1,225 +1,256 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.amp import autocast, GradScaler
+import argparse
+import logging
 import os
 from datetime import datetime
-import logging  # 👈 新增
 
-from dataset_nfp import TextMotionPredictionDataset, DATALoader
-from MDM import MotionDiffusionTransformer, MotionDDPM
-from MDM import MotionDenoisingNetwork, MotionDDPM, TransformerMotionDenoisingNetwork, MotionDiffusionTransformerDecoder
+import torch
+from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# ======================
-# 设置日志
-# ======================
-def setup_logger(log_dir="./logs"):
+from dataset import DATALoaderGeneration
+from MDM_ori import MDMOriginalDenoiser, MotionDDPMOriginal
+
+
+def setup_logger(log_dir: str = "./logs", name: str = "train_mdm_ori") -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"train_{timestamp}.log")
+    log_path = os.path.join(log_dir, f"{name}_{timestamp}.log")
 
-    # 创建 logger
-    logger = logging.getLogger("TrainLogger")
+    logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
-
-    # 避免重复添加 handler（尤其在 Jupyter 或多次运行时）
+    logger.propagate = False
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    # 控制台 handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-
-    # 文件 handler
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-
-    # 格式
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    console_handler.setFormatter(formatter)
-    file_handler.setFormatter(formatter)
-
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
-
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(fmt)
+    logger.addHandler(sh)
+    logger.addHandler(fh)
     return logger
 
 
-def validate(model, val_loader, device, logger):  # 👈 新增 logger 参数
-    """在验证集上评估模型"""
+def build_args():
+    parser = argparse.ArgumentParser(description="Train MDM (MDM_ori.py) on TextMotionGenerationDataset")
+    parser.add_argument("--dataset_name", type=str, default="t2m_272")
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--timesteps", type=int, default=50)
+    parser.add_argument("--min_seq_length", type=int, default=30)
+    parser.add_argument("--max_motion_length", type=int, default=196)
+    parser.add_argument("--unit_length", type=int, default=4)
+    parser.add_argument("--motion_dim", type=int, default=272)
+    parser.add_argument("--latent_dim", type=int, default=512)
+    parser.add_argument("--ff_size", type=int, default=1024)
+    parser.add_argument("--num_layers", type=int, default=8)
+    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--cond_drop_prob", type=float, default=0.1)
+    parser.add_argument("--clip_model", type=str, default="ViT-B/32")
+    parser.add_argument("--save_dir", type=str, default="./checkpoints_mdm_ori")
+    parser.add_argument("--log_dir", type=str, default="./logs")
+    parser.add_argument("--save_every", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume", type=str, default="")
+    return parser.parse_args()
+
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def build_loaders(args):
+    train_loader = DATALoaderGeneration(
+        dataset_name=args.dataset_name,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        split="train",
+        min_seq_length=args.min_seq_length,
+        max_motion_length=args.max_motion_length,
+        unit_length=args.unit_length,
+    )
+    val_loader = DATALoaderGeneration(
+        dataset_name=args.dataset_name,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        split="val",
+        min_seq_length=args.min_seq_length,
+        max_motion_length=args.max_motion_length,
+        unit_length=args.unit_length,
+    )
+    return train_loader, val_loader
+
+
+def build_model(args, device: torch.device):
+    denoiser = MDMOriginalDenoiser(
+        motion_dim=args.motion_dim,
+        seq_len=args.max_motion_length,
+        latent_dim=args.latent_dim,
+        ff_size=args.ff_size,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        dropout=args.dropout,
+        clip_model=args.clip_model,
+        cond_drop_prob=args.cond_drop_prob,
+    ).to(device)
+    model = MotionDDPMOriginal(denoiser=denoiser, timesteps=args.timesteps).to(device)
+    return model
+
+
+@torch.no_grad()
+def validate(model, val_loader, device: torch.device, use_amp: bool) -> float:
     model.eval()
     total_loss = 0.0
-    with torch.no_grad():
-        for captions, x_cond, y_gt, traj in val_loader:
-            x_cond = x_cond.to(device, non_blocking=True)
-            y_gt = y_gt.to(device, non_blocking=True)
+    total_steps = 0
 
-            with autocast(device_type='cuda', enabled=torch.cuda.is_available()):
-                loss = model(x0=y_gt, x_cond=x_cond, text=captions)
-            total_loss += loss.item()
-    avg_val_loss = total_loss / len(val_loader)
-    return avg_val_loss
+    for batch in val_loader:
+        with autocast(device_type="cuda", enabled=use_amp):
+            loss = model.forward_generation_batch(batch=batch, device=device)
+        total_loss += float(loss.item())
+        total_steps += 1
+
+    if total_steps == 0:
+        return float("inf")
+    return total_loss / total_steps
+
+
+def save_checkpoint(path: str, epoch: int, model, optimizer, scheduler, scaler, best_val_loss: float):
+    state = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "best_val_loss": best_val_loss,
+    }
+    torch.save(state, path)
+
+
+def maybe_resume(path: str, model, optimizer, scheduler, scaler, logger: logging.Logger):
+    if not path:
+        return 0, float("inf")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+
+    ckpt = torch.load(path, map_location="cpu")
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    if "scaler_state_dict" in ckpt:
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+    start_epoch = int(ckpt["epoch"]) + 1
+    best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+    logger.info("Resumed from %s (start_epoch=%d, best_val=%.6f)", path, start_epoch, best_val_loss)
+    return start_epoch, best_val_loss
 
 
 def main():
-    logger = setup_logger()  # 👈 初始化日志
+    args = build_args()
+    set_seed(args.seed)
+    os.makedirs(args.save_dir, exist_ok=True)
+    logger = setup_logger(log_dir=args.log_dir)
 
-    # ======================
-    # 超参数设置
-    # ======================
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 32
-    lr = 2e-4
-    weight_decay = 1e-4
-    num_epochs = 100
-    timesteps = 1000
-    save_dir = './checkpoints_ddpm_t2m'
-    os.makedirs(save_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = torch.cuda.is_available()
+    logger.info("Device: %s | AMP: %s", device, use_amp)
+    logger.info("Args: %s", vars(args))
 
-    # ======================
-    # 数据加载：Train & Val
-    # ======================
-    logger.info("Loading training dataset (split=train)...")
-    train_dataset = TextMotionPredictionDataset(
-        dataset_name='t2m_272',
-        min_seq_length=30,
-        split='train'
+    logger.info("Building dataloaders...")
+    train_loader, val_loader = build_loaders(args)
+    logger.info("Train steps/epoch: %d | Val steps: %d", len(train_loader), len(val_loader))
+
+    logger.info("Building MDM model...")
+    model = build_model(args, device)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = GradScaler("cuda", enabled=use_amp)
+
+    start_epoch, best_val_loss = maybe_resume(
+        path=args.resume,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        logger=logger,
     )
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-        collate_fn=lambda batch: (
-            [item[0] for item in batch],
-            torch.stack([torch.from_numpy(item[1]) for item in batch], dim=0),
-            torch.stack([torch.from_numpy(item[2]) for item in batch], dim=0),
-            torch.stack([torch.from_numpy(item[3]) for item in batch], dim=0)
-        )
-    )
-    logger.info(f"Training set: {len(train_dataset)} samples")
 
-    logger.info("Loading validation dataset (split=val)...")
-    val_dataset = TextMotionPredictionDataset(
-        dataset_name='t2m_272',
-        min_seq_length=30,
-        split='val'
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        collate_fn=lambda batch: (
-            [item[0] for item in batch],
-            torch.stack([torch.from_numpy(item[1]) for item in batch], dim=0),
-            torch.stack([torch.from_numpy(item[2]) for item in batch], dim=0),
-            torch.stack([torch.from_numpy(item[3]) for item in batch], dim=0)
-        )
-    )
-    logger.info(f"Validation set: {len(val_dataset)} samples")
-
-    # ======================
-    # 模型初始化
-    # ======================
-    logger.info("Initializing DDPM model...")
-    denoise_net = MotionDiffusionTransformerDecoder(  # ✅ 使用新模型
-        motion_dim=272,
-        num_frames=4,
-        cond_frames=7,      # 👈 确认这个数字与你的数据一致！
-        latent_dim=512,
-        ff_size=1024,
-        num_layers=6,
-        num_heads=8,
-        dropout=0.1,
-    ).to(device)
-
-    ddpm_model = MotionDDPM(
-        model=denoise_net,
-        timesteps=timesteps,
-        loss_type='l2'
-    ).to(device)
-
-    # ======================
-    # 优化器 & 混合精度
-    # ======================
-    optimizer = optim.AdamW(
-        ddpm_model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-        betas=(0.9, 0.99)
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    scaler = GradScaler('cuda', enabled=torch.cuda.is_available())
-
-    # ======================
-    # 训练循环 + 验证
-    # ======================
     logger.info("Start training...")
-    best_val_loss = float('inf')
-    global_step = 0
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        total_loss = 0.0
 
-    for epoch in range(num_epochs):
-        ddpm_model.train()
-        epoch_loss = 0.0
-
-        for batch_idx, (captions, x_cond, y_gt, traj) in enumerate(train_loader):
-            x_cond = x_cond.to(device, non_blocking=True)
-            y_gt = y_gt.to(device, non_blocking=True)
-
-            optimizer.zero_grad()
-
-            with autocast(device_type='cuda', enabled=torch.cuda.is_available()):
-                loss = ddpm_model(x0=y_gt, x_cond=x_cond, text=captions)
-
+        for step, batch in enumerate(train_loader):
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", enabled=use_amp):
+                loss = model.forward_generation_batch(batch=batch, device=device)
             scaler.scale(loss).backward()
-
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(ddpm_model.parameters(), max_norm=1.0)
-
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
-            epoch_loss += loss.item()
-            global_step += 1
+            total_loss += float(loss.item())
+            if step % 50 == 0:
+                logger.info(
+                    "Epoch %d/%d | Step %d/%d | Train Loss %.6f",
+                    epoch + 1,
+                    args.epochs,
+                    step,
+                    len(train_loader),
+                    float(loss.item()),
+                )
 
-            if batch_idx % 50 == 0:
-                logger.info(f"Epoch {epoch+1}/{num_epochs} | Step {batch_idx} | Train Loss: {loss.item():.6f}")
-
-        avg_train_loss = epoch_loss / len(train_loader)
         scheduler.step()
+        train_loss = total_loss / max(len(train_loader), 1)
+        val_loss = validate(model=model, val_loader=val_loader, device=device, use_amp=use_amp)
+        logger.info("Epoch %d | Train Loss %.6f | Val Loss %.6f", epoch + 1, train_loss, val_loss)
 
-        # --- Validation ---
-        logger.info("Running validation...")
-        avg_val_loss = validate(ddpm_model, val_loader, device, logger)
-        logger.info(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+        last_ckpt = os.path.join(args.save_dir, "last.pth")
+        save_checkpoint(
+            path=last_ckpt,
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            best_val_loss=best_val_loss,
+        )
 
-        # --- 保存最佳模型 ---
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            best_ckpt_path = os.path.join(save_dir, "ddpm_t2m_best.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': ddpm_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'train_loss': avg_train_loss,
-            }, best_ckpt_path)
-            logger.info(f"New best model saved (Val Loss: {avg_val_loss:.6f})")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_ckpt = os.path.join(args.save_dir, "best.pth")
+            save_checkpoint(
+                path=best_ckpt,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                best_val_loss=best_val_loss,
+            )
+            logger.info("Saved new best checkpoint: %s", best_ckpt)
 
-        # --- 定期保存 ---
-        if (epoch + 1) % 20 == 0:
-            ckpt_path = os.path.join(save_dir, f"ddpm_t2m_epoch{epoch+1:03d}.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': ddpm_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-                'train_loss': avg_train_loss,
-            }, ckpt_path)
-            logger.info(f"Periodic checkpoint saved: {ckpt_path}")
+        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            epoch_ckpt = os.path.join(args.save_dir, f"epoch_{epoch + 1:03d}.pth")
+            save_checkpoint(
+                path=epoch_ckpt,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                best_val_loss=best_val_loss,
+            )
+            logger.info("Saved periodic checkpoint: %s", epoch_ckpt)
 
-    logger.info("Training completed! Best validation loss: {:.6f}".format(best_val_loss))
+    logger.info("Training finished. Best val loss: %.6f", best_val_loss)
 
 
 if __name__ == "__main__":

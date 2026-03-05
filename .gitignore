@@ -1,24 +1,44 @@
-# 忽略数据集文件夹
+# -----------------------------
+# Dataset / Generated Assets
+# -----------------------------
 humanml3d_272/
-babel_272
+babel_272/
 motion/
 visualize_result/
-babel_272/
 anim/
-checkpoints_ddpm_t2m/
-motion/
-checkpoints_ddpm_t2m/
 
-# 可选：忽略其他常见不需要的文件
+# -----------------------------
+# Training / Eval Outputs
+# -----------------------------
+logs/
+checkpoints_ddpm_t2m/
+checkpoints_mdm_ori/
+checkpoints_samp_v2/
+
+# Evaluator exported bundles / checkpoints
+evaluator/*.pth
+evaluator/*.pt
+evaluator/*.ckpt
+
+# -----------------------------
+# Python Cache / Build
+# -----------------------------
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# -----------------------------
+# Editor / OS
+# -----------------------------
+.idea/
+.vscode/
+.vs/
+.DS_Store
+
+# -----------------------------
+# Temp / Archive
+# -----------------------------
 *.log
 *.tmp
 *.zip
 *.tar.gz
-*.pth
-*.pt
-*.ckpt
-.idea/
-.vscode/
-.DS_Store
