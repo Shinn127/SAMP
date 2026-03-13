@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument(
         "--evaluator_bundle",
         type=str,
-        default="./evaluator/evaluator_272_direct_bundle.pth",
+        default="./evaluator/evaluator_272_src.pth",
         help="Path to evaluator direct bundle (.pth)",
     )
     parser.add_argument("--dataset_name", type=str, default="t2m_272")
@@ -54,6 +54,7 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--cond_drop_prob", type=float, default=0.1)
     parser.add_argument("--clip_model", type=str, default="ViT-B/32")
+    parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--diversity_times", type=int, default=300)
     parser.add_argument("--out_json", type=str, default="")
     return parser.parse_args()
@@ -398,6 +399,7 @@ def run_eval(args):
             shape=torch.Size([b, args.max_motion_length, args.motion_dim]),
             device=device,
             texts=captions,
+            guidance_scale=args.guidance_scale,
         )
 
         if evaluator_max_len > 0:

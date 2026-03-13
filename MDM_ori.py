@@ -187,16 +187,38 @@ class MDMOriginalDenoiser(nn.Module):
 
 
 class MotionDDPMOriginal(nn.Module):
-    """DDPM wrapper for paper-style x0 prediction with L2 loss only."""
+    """DDPM wrapper for paper-style x0 prediction with geometric losses + CFG sampling."""
 
     def __init__(
         self,
         denoiser: nn.Module,
         timesteps: int = 50,
+        lambda_pos: float = 0.0,
+        lambda_vel: float = 0.0,
+        lambda_foot: float = 0.0,
+        num_joints: int = 22,
+        foot_joints: tuple = (10, 11),
+        foot_contact_threshold: float = 0.0025,
     ):
         super().__init__()
         self.denoiser = denoiser
         self.timesteps = timesteps
+        self.lambda_pos = float(lambda_pos)
+        self.lambda_vel = float(lambda_vel)
+        self.lambda_foot = float(lambda_foot)
+        self.num_joints = int(num_joints)
+        self.foot_joints = tuple(int(j) for j in foot_joints)
+        self.foot_contact_threshold = float(foot_contact_threshold)
+
+        self.pos_start = 8
+        self.pos_end = self.pos_start + 3 * self.num_joints
+        self.vel_start = self.pos_end
+        self.vel_end = self.vel_start + 3 * self.num_joints
+        if self.vel_end > self.denoiser.motion_dim:
+            raise ValueError(
+                f"Motion dim {self.denoiser.motion_dim} is too small for 272-style slicing "
+                f"with num_joints={self.num_joints}."
+            )
 
         betas = cosine_beta_schedule(timesteps)
         alphas = 1.0 - betas
@@ -219,6 +241,54 @@ class MotionDDPMOriginal(nn.Module):
         self.register_buffer("posterior_mean_coef1", posterior_mean_coef1)
         self.register_buffer("posterior_mean_coef2", posterior_mean_coef2)
 
+    def _split_pos(self, x: torch.Tensor) -> torch.Tensor:
+        # 272-dim representation: [8:8+3*J] is local joint positions.
+        b, n, _ = x.shape
+        pos = x[:, :, self.pos_start : self.pos_end]
+        return pos.reshape(b, n, self.num_joints, 3)
+
+    def _geom_losses(self, x0: torch.Tensor, pred_x0: torch.Tensor) -> tuple:
+        zero = pred_x0.new_tensor(0.0)
+        gt_pos = self._split_pos(x0)
+        pred_pos = self._split_pos(pred_x0)
+
+        l_pos = F.mse_loss(pred_pos, gt_pos)
+        if gt_pos.shape[1] <= 1:
+            return l_pos, zero, zero
+
+        gt_pos_vel = gt_pos[:, 1:] - gt_pos[:, :-1]
+        pred_pos_vel = pred_pos[:, 1:] - pred_pos[:, :-1]
+        l_vel = F.mse_loss(pred_pos_vel, gt_pos_vel)
+
+        foot_idx = torch.as_tensor(self.foot_joints, device=pred_x0.device, dtype=torch.long)
+        gt_foot_speed = torch.linalg.norm(gt_pos_vel[:, :, foot_idx, :], dim=-1)  # [B, N-1, nfoot]
+        foot_contact = (gt_foot_speed < self.foot_contact_threshold).float().unsqueeze(-1)
+        pred_foot_vel = pred_pos_vel[:, :, foot_idx, :]
+        l_foot = torch.mean((pred_foot_vel * foot_contact) ** 2)
+        return l_pos, l_vel, l_foot
+
+    def _predict_x0(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        texts: Optional[List[str]] = None,
+        cond_emb: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
+    ) -> torch.Tensor:
+        pred_x0_cond = self.denoiser(x_t=x_t, t=t, texts=texts, cond_emb=cond_emb)
+        has_condition = texts is not None or cond_emb is not None
+        if guidance_scale == 1.0 or not has_condition:
+            return pred_x0_cond
+
+        pred_x0_uncond = self.denoiser(
+            x_t=x_t,
+            t=t,
+            texts=texts,
+            cond_emb=cond_emb,
+            force_uncond=True,
+        )
+        return pred_x0_uncond + guidance_scale * (pred_x0_cond - pred_x0_uncond)
+
     @torch.no_grad()
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         if noise is None:
@@ -236,11 +306,39 @@ class MotionDDPMOriginal(nn.Module):
         cond_emb: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        total_loss, _ = self.p_losses_with_stats(
+            x0=x0,
+            t=t,
+            texts=texts,
+            cond_emb=cond_emb,
+            noise=noise,
+        )
+        return total_loss
+
+    def p_losses_with_stats(
+        self,
+        x0: torch.Tensor,
+        t: torch.Tensor,
+        texts: Optional[List[str]] = None,
+        cond_emb: Optional[torch.Tensor] = None,
+        noise: Optional[torch.Tensor] = None,
+    ) -> tuple:
         if noise is None:
             noise = torch.randn_like(x0)
         x_t = self.q_sample(x0=x0, t=t, noise=noise)
         pred_x0 = self.denoiser(x_t=x_t, t=t, texts=texts, cond_emb=cond_emb)
-        return F.mse_loss(pred_x0, x0)
+        l_simple = F.mse_loss(pred_x0, x0)
+        l_pos, l_vel, l_foot = self._geom_losses(x0=x0, pred_x0=pred_x0)
+        total = l_simple + self.lambda_pos * l_pos + self.lambda_vel * l_vel + self.lambda_foot * l_foot
+
+        stats = {
+            "total": total.detach(),
+            "simple": l_simple.detach(),
+            "pos": l_pos.detach(),
+            "vel": l_vel.detach(),
+            "foot": l_foot.detach(),
+        }
+        return total, stats
 
     def forward(
         self,
@@ -257,6 +355,7 @@ class MotionDDPMOriginal(nn.Module):
         self,
         batch,
         device: torch.device,
+        return_components: bool = False,
     ) -> torch.Tensor:
         """
         Compatible with TextMotionGenerationDataset dataloader batch:
@@ -266,7 +365,12 @@ class MotionDDPMOriginal(nn.Module):
         if not torch.is_tensor(motion_batch):
             motion_batch = torch.as_tensor(motion_batch)
         motion_batch = motion_batch.to(device=device, dtype=torch.float32, non_blocking=True)
-        return self.forward(x0=motion_batch, texts=captions)
+        b = motion_batch.shape[0]
+        t = torch.randint(0, self.timesteps, (b,), device=motion_batch.device, dtype=torch.long)
+        loss, stats = self.p_losses_with_stats(x0=motion_batch, t=t, texts=captions)
+        if return_components:
+            return loss, stats
+        return loss
 
     @torch.no_grad()
     def p_sample(
@@ -275,8 +379,15 @@ class MotionDDPMOriginal(nn.Module):
         t: torch.Tensor,
         texts: Optional[List[str]] = None,
         cond_emb: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
-        pred_x0 = self.denoiser(x_t=x_t, t=t, texts=texts, cond_emb=cond_emb)
+        pred_x0 = self._predict_x0(
+            x_t=x_t,
+            t=t,
+            texts=texts,
+            cond_emb=cond_emb,
+            guidance_scale=guidance_scale,
+        )
         mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * pred_x0
             + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
@@ -294,12 +405,19 @@ class MotionDDPMOriginal(nn.Module):
         device: torch.device,
         texts: Optional[List[str]] = None,
         cond_emb: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         x_t = torch.randn(shape, device=device)
         b = shape[0]
         for i in reversed(range(self.timesteps)):
             t = torch.full((b,), i, device=device, dtype=torch.long)
-            x_t = self.p_sample(x_t=x_t, t=t, texts=texts, cond_emb=cond_emb)
+            x_t = self.p_sample(
+                x_t=x_t,
+                t=t,
+                texts=texts,
+                cond_emb=cond_emb,
+                guidance_scale=guidance_scale,
+            )
         return x_t
 
 

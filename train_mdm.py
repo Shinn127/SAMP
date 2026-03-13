@@ -52,6 +52,10 @@ def build_args():
     parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--cond_drop_prob", type=float, default=0.1)
+    parser.add_argument("--lambda_pos", type=float, default=0.0)
+    parser.add_argument("--lambda_vel", type=float, default=0.0)
+    parser.add_argument("--lambda_foot", type=float, default=0.0)
+    parser.add_argument("--foot_contact_threshold", type=float, default=0.0025)
     parser.add_argument("--clip_model", type=str, default="ViT-B/32")
     parser.add_argument("--save_dir", type=str, default="./checkpoints_mdm_ori")
     parser.add_argument("--log_dir", type=str, default="./logs")
@@ -100,25 +104,33 @@ def build_model(args, device: torch.device):
         clip_model=args.clip_model,
         cond_drop_prob=args.cond_drop_prob,
     ).to(device)
-    model = MotionDDPMOriginal(denoiser=denoiser, timesteps=args.timesteps).to(device)
+    model = MotionDDPMOriginal(
+        denoiser=denoiser,
+        timesteps=args.timesteps,
+        lambda_pos=args.lambda_pos,
+        lambda_vel=args.lambda_vel,
+        lambda_foot=args.lambda_foot,
+        foot_contact_threshold=args.foot_contact_threshold,
+    ).to(device)
     return model
 
 
 @torch.no_grad()
-def validate(model, val_loader, device: torch.device, use_amp: bool) -> float:
+def validate(model, val_loader, device: torch.device, use_amp: bool) -> dict:
     model.eval()
-    total_loss = 0.0
+    sum_stats = {"total": 0.0, "simple": 0.0, "pos": 0.0, "vel": 0.0, "foot": 0.0}
     total_steps = 0
 
     for batch in val_loader:
         with autocast(device_type="cuda", enabled=use_amp):
-            loss = model.forward_generation_batch(batch=batch, device=device)
-        total_loss += float(loss.item())
+            _, stats = model.forward_generation_batch(batch=batch, device=device, return_components=True)
+        for k in sum_stats:
+            sum_stats[k] += float(stats[k].item())
         total_steps += 1
 
     if total_steps == 0:
-        return float("inf")
-    return total_loss / total_steps
+        return {k: float("inf") for k in sum_stats}
+    return {k: v / total_steps for k, v in sum_stats.items()}
 
 
 def save_checkpoint(path: str, epoch: int, model, optimizer, scheduler, scaler, best_val_loss: float):
@@ -184,33 +196,53 @@ def main():
     logger.info("Start training...")
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        total_loss = 0.0
+        train_sums = {"total": 0.0, "simple": 0.0, "pos": 0.0, "vel": 0.0, "foot": 0.0}
 
         for step, batch in enumerate(train_loader):
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type="cuda", enabled=use_amp):
-                loss = model.forward_generation_batch(batch=batch, device=device)
+                loss, stats = model.forward_generation_batch(batch=batch, device=device, return_components=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
-            total_loss += float(loss.item())
+            for k in train_sums:
+                train_sums[k] += float(stats[k].item())
             if step % 50 == 0:
                 logger.info(
-                    "Epoch %d/%d | Step %d/%d | Train Loss %.6f",
+                    "Epoch %d/%d | Step %d/%d | Train total %.6f | Lsimple %.6f | Lpos %.6f | Lvel %.6f | Lfoot %.6f",
                     epoch + 1,
                     args.epochs,
                     step,
                     len(train_loader),
-                    float(loss.item()),
+                    float(stats["total"].item()),
+                    float(stats["simple"].item()),
+                    float(stats["pos"].item()),
+                    float(stats["vel"].item()),
+                    float(stats["foot"].item()),
                 )
 
         scheduler.step()
-        train_loss = total_loss / max(len(train_loader), 1)
-        val_loss = validate(model=model, val_loader=val_loader, device=device, use_amp=use_amp)
-        logger.info("Epoch %d | Train Loss %.6f | Val Loss %.6f", epoch + 1, train_loss, val_loss)
+        num_train_steps = max(len(train_loader), 1)
+        train_avg = {k: v / num_train_steps for k, v in train_sums.items()}
+        val_avg = validate(model=model, val_loader=val_loader, device=device, use_amp=use_amp)
+        logger.info(
+            "Epoch %d | Train total %.6f (Lsimple %.6f, Lpos %.6f, Lvel %.6f, Lfoot %.6f) | "
+            "Val total %.6f (Lsimple %.6f, Lpos %.6f, Lvel %.6f, Lfoot %.6f)",
+            epoch + 1,
+            train_avg["total"],
+            train_avg["simple"],
+            train_avg["pos"],
+            train_avg["vel"],
+            train_avg["foot"],
+            val_avg["total"],
+            val_avg["simple"],
+            val_avg["pos"],
+            val_avg["vel"],
+            val_avg["foot"],
+        )
 
         last_ckpt = os.path.join(args.save_dir, "last.pth")
         save_checkpoint(
@@ -223,8 +255,8 @@ def main():
             best_val_loss=best_val_loss,
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_avg["total"] < best_val_loss:
+            best_val_loss = val_avg["total"]
             best_ckpt = os.path.join(args.save_dir, "best.pth")
             save_checkpoint(
                 path=best_ckpt,
